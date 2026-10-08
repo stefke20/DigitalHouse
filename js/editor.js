@@ -4,6 +4,7 @@ import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 import { detectWalls } from './detect.js';
 import { findSimilar } from './match.js';
 import { discoverSymbols } from './discover.js';
+import { NOTE_CATS, ROUTE_KINDS } from './hidden.js';
 
 export const OPENING_DEFAULTS = {
   door: { width: .9, sill: 0, height: 2.05 }, window: { width: 1.2, sill: .9, height: 1.3 },
@@ -19,7 +20,7 @@ export class Editor {
     this.ctx = this.canvas.getContext('2d');
     this.view = { cx: 5, cy: 4, s: 60 };
     this.tool = 'select'; this.symbolId = null; this.symAngle = 0; this.underlay = 'plan'; this.underlayOpacity = .6;
-    this.showBelow = true; this.snapGrid = true; this.sel = null; this.hover = null; this.drag = null; this.drawing = null; this.calib = null;
+    this.showBelow = true; this.showNames = false; this.snapGrid = true; this.sel = null; this.hover = null; this.drag = null; this.drawing = null; this.calib = null;
     this.openingType = 'door'; this.undoStack = []; this.redoStack = []; this.bitmaps = {}; this.mouse = { x: 0, y: 0, wx: 0, wy: 0 };
     this.level = null; this.fitted = false;
     this.ro = new ResizeObserver(() => { this.resize(); this.draw(); }); this.ro.observe(host);
@@ -27,8 +28,8 @@ export class Editor {
     c.addEventListener('pointerdown', e => this.pdown(e)); c.addEventListener('pointermove', e => this.pmove(e));
     c.addEventListener('pointerup', e => this.pup(e)); c.addEventListener('pointercancel', e => this.pup(e));
     c.addEventListener('wheel', e => this.wheel(e), { passive: false });
-    c.addEventListener('dblclick', () => { if (this.tool === 'wall') this.drawing = null; this.draw(); });
-    c.addEventListener('contextmenu', e => { e.preventDefault(); this.drawing = null; this.calib = null; this.draw(); });
+    c.addEventListener('dblclick', () => { if (this.tool === 'wall') this.drawing = null; if (this.tool === 'route') { this.finishRoute(); } this.draw(); });
+    c.addEventListener('contextmenu', e => { e.preventDefault(); this.drawing = null; this.calib = null; if (this.routing) this.finishRoute(); this.draw(); });
     this.keyh = e => this.key(e); window.addEventListener('keydown', this.keyh);
     this.resize();
   }
@@ -52,13 +53,18 @@ export class Editor {
       if (u && !this.bitmaps[u.docId]) this.bitmaps[u.docId] = await this.getImage(u.docId);
     }
   }
-  setTool(t) { this.tool = t; this.drawing = null; this.calib = null; this.canvas.style.cursor = t === 'pan' ? 'grab' : t === 'select' ? 'default' : 'crosshair'; this.cb.onTool(t); this.status(); this.draw(); }
+  finishRoute() {
+    const r = this.routing; this.routing = null;
+    if (r && r.pts.length >= 2) { this.pushUndo(); const k = this.routeKind || 'cable', route = { id: uid('rt'), kind: k, pts: r.pts, z: ROUTE_KINDS[k].z, label: '' }; this.level.routes.push(route); this.changed(); this.select({ type: 'route', id: route.id, item: route }); }
+    this.draw();
+  }
+  setTool(t) { this.routing && this.finishRoute(); this.tool = t; this.drawing = null; this.calib = null; this.canvas.style.cursor = t === 'pan' ? 'grab' : t === 'select' ? 'default' : 'crosshair'; this.cb.onTool(t); this.status(); this.draw(); }
   setSymbol(id) { this.symbolId = id; this.setTool('symbol'); }
   setUnderlay(k) { this.underlay = k; this.draw(); }
   changed() { this.project.updated = Date.now(); this.cb.onChange(); }
-  snapshot() { const l = this.level; return JSON.stringify({ id: l.id, walls: l.walls, openings: l.openings, symbols: l.symbols, columns: l.columns, rooms: l.rooms, underlays: l.underlays }); }
+  snapshot() { const l = this.level; return JSON.stringify({ id: l.id, walls: l.walls, openings: l.openings, symbols: l.symbols, columns: l.columns, rooms: l.rooms, notes: l.notes, routes: l.routes, underlays: l.underlays }); }
   pushUndo() { if (!this.level) return; this.undoStack.push(this.snapshot()); if (this.undoStack.length > 60) this.undoStack.shift(); this.redoStack = []; }
-  restore(s) { const o = JSON.parse(s), l = this.project.levels.find(x => x.id === o.id); if (!l) return; Object.assign(l, { walls: o.walls, openings: o.openings, symbols: o.symbols, columns: o.columns || [], rooms: o.rooms || [], underlays: o.underlays }); this.sel = null; this.cb.onSelect(null); this.changed(); this.draw(); }
+  restore(s) { const o = JSON.parse(s), l = this.project.levels.find(x => x.id === o.id); if (!l) return; Object.assign(l, { walls: o.walls, openings: o.openings, symbols: o.symbols, columns: o.columns || [], rooms: o.rooms || [], notes: o.notes || [], routes: o.routes || [], underlays: o.underlays }); this.sel = null; this.cb.onSelect(null); this.changed(); this.draw(); }
   undo() { if (!this.undoStack.length) return; this.redoStack.push(this.snapshot()); this.restore(this.undoStack.pop()); }
   redo() { if (!this.redoStack.length) return; this.undoStack.push(this.snapshot()); this.restore(this.redoStack.pop()); }
 
@@ -121,6 +127,8 @@ export class Editor {
   hit(wx, wy) {
     const l = this.level, px = 1 / this.view.s;
     for (let i = l.symbols.length - 1; i >= 0; i--) { const s = l.symbols[i]; if (Math.hypot(s.x - wx, s.y - wy) < Math.max(.2, 10 * px)) return { type: 'symbol', id: s.id, item: s }; }
+    for (const n of l.notes) if (Math.hypot(n.x - wx, n.y - wy) < Math.max(.25, 12 * px)) return { type: 'note', id: n.id, item: n };
+    for (const r of l.routes) for (let i = 0; i + 1 < r.pts.length; i++) if (distPtSeg(wx, wy, r.pts[i][0], r.pts[i][1], r.pts[i + 1][0], r.pts[i + 1][1]).d < Math.max(.12, 7 * px)) return { type: 'route', id: r.id, item: r };
     for (const r of l.rooms) { if (Math.abs(r.x - wx) < Math.max(.5, r.text.length * 6 / this.view.s) && Math.abs(r.y - wy) < Math.max(.25, 9 / this.view.s)) return { type: 'room', id: r.id, item: r }; }
     for (const c of l.columns) { if (Math.abs(c.x - wx) <= c.w / 2 + 4 * px && Math.abs(c.y - wy) <= (c.d || c.w) / 2 + 4 * px) return { type: 'column', id: c.id, item: c }; }
     for (const o of l.openings) {
@@ -141,6 +149,8 @@ export class Editor {
     if (type === 'opening') l.openings = l.openings.filter(o => o.id !== id);
     if (type === 'symbol') l.symbols = l.symbols.filter(s => s.id !== id);
     if (type === 'column') l.columns = l.columns.filter(c => c.id !== id);
+    if (type === 'note') l.notes = l.notes.filter(c => c.id !== id);
+    if (type === 'route') l.routes = l.routes.filter(c => c.id !== id);
     if (type === 'room') l.rooms = l.rooms.filter(c => c.id !== id);
     this.select(null); this.changed();
   }
@@ -180,6 +190,11 @@ export class Editor {
       this.level.columns.push(c); this.changed(); this.select({ type: 'column', id: c.id, item: c });
     } else if (t === 'measure') {
       const p = this.snapPt(wx, wy, { noGrid: true }); this.meas = (!this.meas || this.meas.b) ? { a: [p[0], p[1]] } : { ...this.meas, b: [p[0], p[1]] };
+    } else if (t === 'note') {
+      const text = prompt('Note (what is hidden / important here?):'); if (text) { this.pushUndo(); const n = { id: uid('n'), x: wx, y: wy, z: 1.2, text, cat: this.noteCat || 'other' }; this.level.notes.push(n); this.changed(); this.select({ type: 'note', id: n.id, item: n }); }
+    } else if (t === 'route') {
+      const p = this.snapPt(wx, wy, { from: this.routing ? this.routing.pts[this.routing.pts.length - 1] : null, noGrid: e.altKey });
+      if (!this.routing) this.routing = { pts: [[p[0], p[1]]] }; else if (Math.hypot(p[0] - this.routing.pts.at(-1)[0], p[1] - this.routing.pts.at(-1)[1]) > .03) this.routing.pts.push([p[0], p[1]]);
     } else if (t === 'room') {
       const text = prompt('Room / zone name:'); if (text) { this.pushUndo(); const r = { id: uid('r'), text, x: wx, y: wy }; this.level.rooms.push(r); this.changed(); this.select({ type: 'room', id: r.id, item: r }); }
     } else if (t === 'teach') {
@@ -228,7 +243,9 @@ export class Editor {
         if (d.h.type === 'symbol') {
           const def = getSymbol(it.type), sn = def && def.mount === 'wall' ? this.wallSnapForSymbol(wx, wy) : null;
           if (sn) { it.x = sn.x; it.y = sn.y; it.angle = sn.angle; } else { it.x = Math.round((d.orig.x + dx) / .05) * .05; it.y = Math.round((d.orig.y + dy) / .05) * .05; }
-        } else if (d.h.type === 'column' || d.h.type === 'room') {
+        } else if (d.h.type === 'route') {
+          const sx2 = Math.round(dx / .05) * .05, sy2 = Math.round(dy / .05) * .05; it.pts = d.orig.pts.map(p => [p[0] + sx2, p[1] + sy2]);
+        } else if (d.h.type === 'column' || d.h.type === 'room' || d.h.type === 'note') {
           it.x = Math.round((d.orig.x + dx) / .05) * .05; it.y = Math.round((d.orig.y + dy) / .05) * .05;
         } else if (d.h.type === 'wall') {
           const sx2 = Math.round(dx / .05) * .05, sy2 = Math.round(dy / .05) * .05;
@@ -260,7 +277,7 @@ export class Editor {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); return; }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); this.redo(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') { this.deleteSelected(); e.preventDefault(); }
-    else if (e.key === 'Escape') { this.drawing = null; this.calib = null; this.select(null); this.setTool('select'); }
+    else if (e.key === 'Escape') { if (this.routing) { this.finishRoute(); return; } this.drawing = null; this.calib = null; this.select(null); this.setTool('select'); }
     else if (e.key.toLowerCase() === 'r') {
       if (this.tool === 'symbol') this.symAngle += Math.PI / 2;
       else if (this.sel && this.sel.type === 'symbol') this.update({ angle: (this.sel.item.angle || 0) + Math.PI / 2 });
@@ -279,7 +296,7 @@ export class Editor {
   }
   status() {
     const { wx, wy } = this.mouse;
-    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', sectional: 'Click on an outer wall to place an overhead (sectional) door', dock: 'Click on a wall to place a loading-dock door', rollup: 'Click on a wall to place a roller shutter', column: 'Click to place a structural column', room: 'Click to name a room / zone', measure: 'Click two points to measure a distance (snaps to wall ends)', teach: 'Drag a box around ONE example symbol on the drawing', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
+    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', sectional: 'Click on an outer wall to place an overhead (sectional) door', dock: 'Click on a wall to place a loading-dock door', rollup: 'Click on a wall to place a roller shutter', column: 'Click to place a structural column', room: 'Click to name a room / zone', note: 'Click to drop a pin with a note (water shut-off, gas meter, cable behind the wall…)', route: 'Click points to draw a pipe / cable route · double-click or right-click to finish', measure: 'Click two points to measure a distance (snaps to wall ends)', teach: 'Drag a box around ONE example symbol on the drawing', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
     this.cb.onStatus(`${wx.toFixed(2)} m, ${wy.toFixed(2)} m  ·  ${hints[this.tool] || ''}`);
   }
 
@@ -345,6 +362,8 @@ export class Editor {
     this.changed(); this.draw();
   }
   setOcrOverlay(res) { const u = this.level.underlays[this.underlay]; this.ocrOverlay = res ? res.dims.map(d => ({ x: u.ox + (d.box.x0 + d.box.x1) / 2 / u.pxPerM, y: u.oy + (d.box.y0 + d.box.y1) / 2 / u.pxPerM, text: d.text, used: !!d.L })) : null; this.draw(); }
+  exportPng() { return new Promise(r => this.canvas.toBlob(r, 'image/png')); }
+  focusOn(x, y, zoom = 70) { this.view.cx = x; this.view.cy = y; this.view.s = Math.max(this.view.s, zoom); this.draw(); }
   autoAlign() {
     const lv = [...this.project.levels].sort((a, b) => a.order - b.order), i = lv.indexOf(this.level);
     const ref = [...lv.slice(0, i).reverse(), ...lv.slice(i + 1)].find(l => l.walls.length);
@@ -369,9 +388,12 @@ export class Editor {
       if (i > 0) { ctx.globalAlpha = .35; this.drawWalls(ctx, lv[i - 1], '#6b8bd6', true); ctx.globalAlpha = 1; }
     }
     this.drawWalls(ctx, l, bmp && this.underlayOpacity > .35 ? '#2563eb' : '#cbd5e1');
+    for (const r of l.routes) { const k = ROUTE_KINDS[r.kind] || ROUTE_KINDS.cable, sel = this.sel && this.sel.id === r.id; ctx.strokeStyle = sel ? '#f59e0b' : k.color; ctx.lineWidth = Math.max(.05, 3 / v.s); ctx.setLineDash([.25, .12]); ctx.beginPath(); r.pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke(); ctx.setLineDash([]); }
+    if (this.routing) { const k = ROUTE_KINDS[this.routeKind || 'cable'], pts = [...this.routing.pts, [this.mouse.wx, this.mouse.wy]]; ctx.strokeStyle = k.color; ctx.lineWidth = Math.max(.05, 3 / v.s); ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke(); }
     for (const c of l.columns) { const sel = this.sel && this.sel.id === c.id; ctx.fillStyle = sel ? '#f59e0b' : '#94a3b8'; ctx.strokeStyle = '#0b1220'; ctx.lineWidth = .02; if (c.round) { ctx.beginPath(); ctx.arc(c.x, c.y, c.w / 2, 0, 7); ctx.fill(); ctx.stroke(); } else { ctx.fillRect(c.x - c.w / 2, c.y - (c.d || c.w) / 2, c.w, c.d || c.w); ctx.strokeRect(c.x - c.w / 2, c.y - (c.d || c.w) / 2, c.w, c.d || c.w); } }
     ctx.restore();
     for (const r of l.rooms) { const [x, y] = this.w2s(r.x, r.y), sel = this.sel && this.sel.id === r.id; ctx.font = '600 13px sans-serif'; ctx.textAlign = 'center'; const w = ctx.measureText(r.text).width + 12; ctx.fillStyle = '#0b1220cc'; ctx.fillRect(x - w / 2, y - 10, w, 20); ctx.strokeStyle = sel ? '#f59e0b' : '#475569'; ctx.strokeRect(x - w / 2, y - 10, w, 20); ctx.fillStyle = '#e2e8f0'; ctx.textBaseline = 'middle'; ctx.fillText(r.text, x, y + 1); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; }
+    for (const n of l.notes) { const [x, y] = this.w2s(n.x, n.y), c = NOTE_CATS[n.cat] || NOTE_CATS.other, sel = this.sel && this.sel.id === n.id; ctx.fillStyle = '#0b1220'; ctx.strokeStyle = sel ? '#f59e0b' : c.color; ctx.lineWidth = sel ? 3 : 2; ctx.beginPath(); ctx.arc(x, y, 12, 0, 7); ctx.fill(); ctx.stroke(); ctx.font = '13px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff'; ctx.fillText(c.icon, x, y + 1); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; if (this.showNames || sel) { ctx.font = '12px sans-serif'; const w = ctx.measureText(n.text).width + 10; ctx.fillStyle = '#0b1220ee'; ctx.fillRect(x + 14, y - 9, w, 18); ctx.fillStyle = '#e2e8f0'; ctx.fillText(n.text, x + 19, y + 4); } }
     if (this.ocrOverlay) for (const o of this.ocrOverlay) { const [x, y] = this.w2s(o.x, o.y); ctx.strokeStyle = o.used ? '#34d399' : '#fbbf24'; ctx.lineWidth = 2; ctx.strokeRect(x - 16, y - 9, 32, 18); }
     this.drawSymbols(ctx);
     this.drawOverlay(ctx);
@@ -427,6 +449,7 @@ export class Editor {
     for (const s of this.level.symbols) {
       const def = getSymbol(s.type); if (!def) continue;
       const [x, y] = this.w2s(s.x, s.y);
+      if (this.showNames && s.label) { ctx.font = '11px sans-serif'; const w = ctx.measureText(s.label).width + 8, [nx, ny] = [x, y]; ctx.fillStyle = '#0b1220dd'; ctx.fillRect(nx - w / 2, ny + 15, w, 15); ctx.fillStyle = '#e2e8f0'; ctx.textAlign = 'center'; ctx.fillText(s.label, nx, ny + 26); ctx.textAlign = 'left'; }
       this.__len = s.len; this.drawSymbol(ctx, def, x, y, s.angle || 0, { sel: this.sel && this.sel.id === s.id }); this.__len = null;
     }
   }

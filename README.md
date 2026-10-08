@@ -56,6 +56,24 @@ Everything stays editable afterwards in the Floor plans / Electrical tabs. Prefe
 * 📐 **measure** tool, ✨ **discover repeated symbols** (finds groups of identical glyphs on a situatieschema – you
   name each group once), 🔍 teach-by-example, OCR.
 
+## Naming, devices and hidden installations
+
+* **Rename anything.** Double-click a device in the 3D view, edit the *Name* field in the Electrical tab (✨ suggests
+  “Bathroom ceiling light 1” from the room and device type), or use the **Devices** tab: a searchable table of every
+  device where you type names straight into the cells, change circuits, auto-name everything (“Garage socket 1”,
+  “Kitchen worktop socket 2”…), and jump to a device in 3D (🎯 it pulses) or on the plan. Lighting groups (✎), circuits
+  (give each breaker the label from your fuse box), levels, rooms and documents are renamable too. Names show on the
+  plan and in 3D (*Names* / *Device names* toggles) and in the report and CSV.
+* **Pins & notes** 📌: drop a pin where the water shut-off, gas meter or a junction box hides (categories water, gas,
+  electricity, heating, network, structure). **Pipe & cable routes** 〰: draw water, heating, gas, drain, cable and
+  network routes with a height (negative = under the floor). Both appear in 3D (toggle *Pins, pipes & cables*), in the
+  3D side panel and in the report.
+* **Walk through** 🚶: first-person view at eye height (WASD / arrows, drag to look, doors and switches stay clickable,
+  walls block you, doorways let you through). **Click a door** in 3D to swing it open.
+* **Exports:** ⬇ the 3D model as **.glb** (Blender, Windows 3D Viewer, web), 🖼 *Save image* of the plan, 📄 report,
+  📊 device list (CSV).
+* **Lighting load:** typical LED wattage per lamp → “Lighting now: 84 W” in the panel, per-circuit load in Devices.
+
 ## Manual workflow
 
 1. **Home → "Click here to upload your plan"**. Add one file per level (basement, ground, first, second, attic…); each can

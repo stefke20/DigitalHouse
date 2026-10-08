@@ -84,6 +84,13 @@ export function demoProject() {
   sym(f, 'sock_double', .17, 6.0, 0, { circuit: '13' }); sym(f, 'sock_single', 3.44, 6.0, Math.PI, { circuit: '13' }); sym(f, 'sock_ip44', 8.2, 7.83, -D, { circuit: '12', z: 1.2 });
   sym(f, 'sock_double', 6.56, 6.5, 0, { circuit: '14', z: .3 }); sym(f, 'data_rj45', .17, 2.0, 0, { z: .3 }); sym(f, 'data_rj45', 9.83, 1.0, Math.PI, { z: .3 });
   sym(f, 'safe_smoke', 5, 3, 0); sym(f, 'safe_smoke', 2.5, 3, 0); sym(f, 'safe_smoke', 7.5, 3, 0);
+  b.notes.push({ id: uid('n'), x: 9.6, y: 7.0, z: 1.0, cat: 'water', text: 'Main water stopcock – turn clockwise to close' }, { id: uid('n'), x: .5, y: 1.0, z: 1.2, cat: 'gas', text: 'Gas meter & main gas valve' });
+  g.notes.push({ id: uid('n'), x: 8.8, y: 1.0, z: .5, cat: 'water', text: 'Kitchen: shut-off valves under the sink' }, { id: uid('n'), x: 4.0, y: 5.0, z: 1.2, cat: 'electric', text: 'Junction box behind this wall (accessible from the hall)' });
+  b.routes.push({ id: uid('rt'), kind: 'water', pts: [[9.6, 7.0], [9.6, 2.5], [8.8, 2.5], [8.8, 1.0]], z: 2.2, label: 'Cold water supply' });
+  g.routes.push({ id: uid('rt'), kind: 'cable', pts: [[4.1, 7.3], [4.1, 5.2], [3.0, 5.2], [3.0, 2.5]], z: 2.35, label: 'Living circuit' }, { id: uid('rt'), kind: 'heating', pts: [[.5, 3], [.5, 7.5], [3.8, 7.5]], z: .2, label: 'Radiator loop' });
+  const R = (lv, text, x, y) => lv.rooms.push({ id: uid('r'), text, x, y });
+  R(b, 'Storage', 2.5, 2); R(b, 'Utility room', 7.5, 6); R(g, 'Living room', 3, 2.5); R(g, 'Kitchen', 8, 2.5); R(g, 'Office', 2, 6.5); R(g, 'Hall', 7, 6.5);
+  R(f, 'Bedroom 1', 2.5, 2); R(f, 'Bedroom 2', 7.5, 2); R(f, 'Bedroom 3', 1.7, 6); R(f, 'Landing', 5, 6); R(f, 'Bathroom', 8.2, 6);
   p.levels.push(b, g, f);
   for (const l of p.levels) for (const s of l.symbols) if (s.z == null) delete s.z;
   return p;

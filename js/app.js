@@ -1,11 +1,13 @@
 import { h, toast, modal, uid, debounce, fmtBytes, download } from './util.js';
 import * as db from './db.js';
-import { LEVEL_PRESETS, presetsFor, newLevel, newProject, sortedLevels, wallLen, normalizeProject } from './model.js';
+import { LEVEL_PRESETS, presetsFor, newLevel, newProject, sortedLevels, wallLen, normalizeProject, roomGrid, elevations } from './model.js';
 import { SYMBOLS, CATEGORIES, allSymbols, getSymbol, svgMarkup, loadCustomSymbols, saveCustomSymbol, removeCustomSymbol } from './symbols.js';
 import { rasterize, isPdf, pdfPageCount } from './files.js';
 import { demoProject, demoIndustrial } from './demo.js';
 import { analyze, buildProject } from './pipeline.js';
 import { computeStats } from './stats.js';
+import { autoName, shortName, wattOf, roomNameFor } from './naming.js';
+import { NOTE_CATS, ROUTE_KINDS } from './hidden.js';
 import { buildReport, buildCsv } from './report.js';
 import { autoWire, needsWiring, isLamp, isSwitch } from './wiring.js';
 import { getImage, saveNow, loadProject, countSyms, storeDoc, addUnderlay } from './store.js';
@@ -239,7 +241,7 @@ async function pageProject(id, tab, q) {
   view.className = 'fill';
   const save = debounce(() => saveNow(project), 350);
   const nameIn = h('input', { class: 'name', value: project.name, onchange: () => { project.name = nameIn.value || 'My house'; save(); } });
-  const tabs = h('div', { class: 'tabs' }, [['3d', '3D view'], ['plans', 'Floor plans'], ['electrical', 'Electrical'], ['docs', 'Documents']].map(([k, t]) => h('a', { href: `#/project/${id}/${k}`, class: k === tab ? 'active' : '' }, t)));
+  const tabs = h('div', { class: 'tabs' }, [['3d', '3D view'], ['plans', 'Floor plans'], ['electrical', 'Electrical'], ['devices', 'Devices'], ['docs', 'Documents']].map(([k, t]) => h('a', { href: `#/project/${id}/${k}`, class: k === tab ? 'active' : '' }, t)));
   const body = h('div', { class: 'projbody' });
   const bar = h('div', { class: 'projbar' }, h('a', { href: '#/projects', class: 'muted' }, '← Projects'), nameIn, tabs, h('div', { style: { flex: 1 } }),
     h('button', { class: 'small', title: 'Printable overview: areas, rooms, devices per circuit', onclick: () => download(new Blob([buildReport(project)], { type: 'text/html' }), project.name.replace(/\W+/g, '_') + '_report.html') }, '📄 Report'),
@@ -248,7 +250,8 @@ async function pageProject(id, tab, q) {
     h('a', { class: 'btn small primary', href: '#/projects', onclick: async () => { await saveNow(project); toast('Saved – your visualization is in My Projects', 'ok'); } }, 'Done'));
   view.append(h('div', { class: 'proj' }, bar, body));
   let inner = null;
-  if (tab === '3d') inner = tab3d(project, body, save);
+  if (tab === '3d') inner = tab3d(project, body, save, q);
+  else if (tab === 'devices') inner = tabDevices(project, body, save);
   else if (tab === 'plans' || tab === 'electrical') inner = tabEditor(project, body, save, tab, q);
   else inner = tabDocs(project, body);
   cleanup = () => { inner && inner(); saveNow(project); };
@@ -261,21 +264,30 @@ async function exportProject(project) {
 }
 
 /* ---------------- 3D tab ---------------- */
-function tab3d(project, body, save) {
+function tab3d(project, body, save, q = new URLSearchParams()) {
   let viewer = null, dead = false;
   const host = h('div', { class: 'v3d' }), side = h('div', { class: 'sidepanel' });
   body.append(host, side);
   import('./view3d.js').then(({ Viewer }) => {
     if (dead) return;
     if (needsWiring(project)) { autoWire(project); saveNow(project); }
-    viewer = new Viewer(host, { getImage, onLights: () => fillLights() });
+    viewer = new Viewer(host, { getImage, onLights: () => fillLights(), onRename: (sym, level) => renameModal(project, sym, level, () => { save(); viewer.build(); buildPanel(); }), onWalk });
+    window.__viewer = () => viewer;
     viewer.set({ roof: project.settings.roof !== false });
     viewer.setProject(project);
     buildPanel();
+    const fo = q.get('focus'); if (fo) { const lv = project.levels.find(l => l.symbols.some(x => x.id === fo)); if (lv) { viewer.opts.visible.add(lv.id); viewer.build(); setTimeout(() => viewer.focusSymbol(fo), 200); } }
     setTimeout(() => { if (!dead && (!project.thumb || (project.thumbAt || 0) < project.updated - 1000)) makeThumb(); }, 700);
   }).catch(e => { console.error(e); host.append(h('div', { class: 'empty' }, 'WebGL is not available in this browser.')); });
   const makeThumb = () => { try { project.thumb = viewer.snapshot(480, 300); project.thumbAt = Date.now(); saveNow(project); } catch (e) { } };
 
+  const walkHint = h('div', { class: 'hint', style: { display: 'none', left: '50%', transform: 'translateX(-50%)', bottom: '14px', textAlign: 'center' } });
+  host.append(walkHint);
+  function onWalk(on, lv) {
+    walkHint.style.display = on ? 'block' : 'none'; if (!on) return;
+    const sel = h('select', { onchange: () => { viewer.stopWalk(); viewer.startWalk(sel.value); } }, sortedLevels(project).filter(l => l.walls.length).map(l => h('option', { value: l.id, selected: l.id === lv.id }, l.name)));
+    walkHint.innerHTML = ''; walkHint.append(h('b', { style: { color: '#fff' } }, '🚶 Walking'), '  W A S D / arrows = move · drag = look · Shift = run · click doors and switches · ', sel, ' ', h('button', { class: 'small', onclick: () => viewer.stopWalk() }, 'Exit (Esc)'));
+  }
   const levels = sortedLevels(project);
   if (!levels.some(l => l.walls.length)) host.append(h('div', { class: 'hint', style: { left: '12px', top: '12px', bottom: 'auto' } }, 'Nothing to show yet – ', h('a', { href: `#/project/${project.id}/plans` }, 'trace the walls in Floor plans'), '.'));
   let playTimer = null; const buildPanelHour = () => { };
@@ -291,12 +303,13 @@ function tab3d(project, body, save) {
       list.append(h('div', { class: 'layer' + (g.value > 0 ? '' : ' off'), style: { flexWrap: 'wrap' } },
         h('button', { class: 'small' + (g.value > 0 ? ' active' : ''), title: 'Switch this group on / off', onclick: () => viewer.toggleGroup(g.levelId, g.ctl) }, g.value > 0 ? '💡 On' : '○ Off'),
         h('span', { class: 'nm', style: { fontSize: '12.5px' } }, g.name, h('span', { class: 'muted' }, ` · ${g.levelName} · ${g.count}`)),
+        h('button', { class: 'small', title: 'Rename this lighting group', onclick: () => { const nm = prompt('Name for this lighting group:', g.name); if (nm) { const lv = project.levels.find(l => l.id === g.levelId); (lv.groupNames ||= {})[g.ctl || ''] = nm; save(); fillLights(); } } }, '✎'),
         g.dimmer ? h('input', { type: 'range', min: .1, max: 1, step: .05, value: g.value || 1, style: { width: '100%' }, title: 'Dimmer', oninput: e => { viewer.lightState.set(g.key, +e.target.value); viewer.updateLights(); } }) : null));
     }
     lightHolder.append(h('h4', {}, 'Lighting'),
       h('div', { class: 'row chk' }, h('label', { for: 'cknight' }, '🌙 Night mode'), night),
       h('div', { class: 'row' }, h('button', { class: 'small primary', onclick: () => { viewer.set({ night: true }); viewer.allLights(true); } }, 'Evening: all lights on'), h('button', { class: 'small', onclick: () => viewer.allLights(false) }, 'All off')),
-      list, h('div', { class: 'muted', style: { fontSize: '12px', margin: '4px 0 6px' } }, 'Click any switch or lamp in the 3D view to flick it. Wiring was guessed from the plan (a switch controls the lamps of the room it faces) – fix it per symbol in the Electrical tab.'));
+      h('div', { class: 'muted', style: { fontSize: '12.5px' } }, `Lighting now: ${viewer.lightLoad()} W`), list, h('div', { class: 'muted', style: { fontSize: '12px', margin: '4px 0 6px' } }, 'Click any switch or lamp in the 3D view to flick it. Wiring was guessed from the plan (a switch controls the lamps of the room it faces) – fix it per symbol in the Electrical tab.'));
   }
   function buildPanel() {
     side.innerHTML = '';
@@ -321,7 +334,7 @@ function tab3d(project, body, save) {
     const ck = (label, key) => h('div', { class: 'row chk' }, h('label', { for: 'ck' + key }, label), h('input', { type: 'checkbox', id: 'ck' + key, checked: viewer.opts[key], onchange: e => { viewer.set({ [key]: e.target.checked }); if (key === 'roof') { project.settings.roof = e.target.checked; save(); } } }));
     side.append(h('div', {}, h('h4', {}, 'Explore'),
       sl('Explode floors', 'explode', 0, 4, .1, viewer.opts.explode), sl('Section cut', 'clip', 0.05, 1, .01, viewer.opts.clip),
-      ck('X-ray walls', 'xray'), ck('Roof', 'roof'), ck('Room labels', 'rooms'), ck('Electrical devices', 'devices'), ck('Symbol markers', 'markers'), ck('Floor plan on floor', 'planTex')));
+      ck('X-ray walls', 'xray'), ck('Roof', 'roof'), ck('Room labels', 'rooms'), ck('Device names', 'names'), ck('Pins, pipes & cables', 'hidden'), ck('Electrical devices', 'devices'), ck('Symbol markers', 'markers'), ck('Floor plan on floor', 'planTex')));
     const st = project.settings;
     side.append(h('div', {}, h('h4', {}, 'Roof'), h('div', { class: 'row' }, h('label', {}, 'Shape'), h('select', { onchange: e => { st.roofType = e.target.value; save(); viewer.build(); } }, [['flat', 'Flat'], ['gable', 'Gable (two-pitch)']].map(([v, t]) => h('option', { value: v, selected: st.roofType === v }, t)))),
       h('div', { class: 'row' }, h('label', {}, 'Pitch ' + (st.roofPitch || 8) + '°'), h('input', { type: 'range', min: 3, max: 45, step: 1, value: st.roofPitch || 8, onchange: e => { st.roofPitch = +e.target.value; save(); viewer.build(); buildPanel(); } }))));
@@ -357,7 +370,10 @@ function tab3d(project, body, save) {
       h('div', { class: 'row' }, h('label', {}, 'Plan “up” faces'), h('input', { type: 'number', step: 5, value: st.north || 0, style: { width: '64px' }, title: 'Compass bearing of the top of the plan in degrees (0 = north, 90 = east, 180 = south)', onchange: e => { st.north = +e.target.value; save(); upd(); } }), h('span', { class: 'muted' }, '° (0 = north)')),
       h('div', { class: 'row' }, h('button', { class: 'small', onclick: e => { if (playTimer) { clearInterval(playTimer); playTimer = null; e.target.textContent = '▶ Play the day'; return; } viewer.opts.sunOn = true; viewer.opts.hour = 5; e.target.textContent = '⏸ Pause'; playTimer = setInterval(() => { viewer.opts.hour += .25; if (viewer.opts.hour > 22) viewer.opts.hour = 5; upd(); buildPanelHour(); }, 140); } }, '▶ Play the day')), sunTxt));
     const circuits = [...new Set(project.levels.filter(l => viewer.opts.visible.has(l.id)).flatMap(l => l.symbols.map(x => String(x.circuit || '')).filter(Boolean)))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    if (circuits.length) side.append(h('div', {}, h('h4', {}, 'Highlight a circuit (breaker)'), h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px' } }, h('button', { class: 'small' + (!viewer.opts.circuit ? ' active' : ''), onclick: () => { viewer.set({ circuit: null }); buildPanel(); } }, 'All'), circuits.map(c => h('button', { class: 'small' + (viewer.opts.circuit === c ? ' active' : ''), onclick: () => { viewer.set({ circuit: c }); buildPanel(); } }, c))), viewer.opts.circuit ? h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, `Showing only the devices on circuit ${viewer.opts.circuit}.`) : null));
+    if (circuits.length) side.append(h('div', {}, h('h4', {}, 'Highlight a circuit (breaker)'), h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px' } }, h('button', { class: 'small' + (!viewer.opts.circuit ? ' active' : ''), onclick: () => { viewer.set({ circuit: null }); buildPanel(); } }, 'All'), circuits.map(c => h('button', { class: 'small' + (viewer.opts.circuit === c ? ' active' : ''), title: (project.circuitNames || {})[c] || '', onclick: () => { viewer.set({ circuit: c }); buildPanel(); } }, c))), viewer.opts.circuit ? h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, `Showing only the devices on circuit ${viewer.opts.circuit}${(project.circuitNames || {})[viewer.opts.circuit] ? ' – ' + project.circuitNames[viewer.opts.circuit] : ''}.`) : null));
+    const cn = project.circuitNames || {};
+    const notes = project.levels.filter(l => viewer.opts.visible.has(l.id)).flatMap(l => (l.notes || []).map(n => ({ n, l })));
+    if (notes.length) { const els = elevations(project); side.append(h('div', {}, h('h4', {}, 'Pins & notes'), ...notes.map(({ n, l }) => h('div', { class: 'layer', style: { cursor: 'pointer' }, onclick: () => viewer.focusPoint(n.x, n.y, els[l.id] + (n.z ?? 1.2)) }, h('span', {}, (NOTE_CATS[n.cat] || NOTE_CATS.other).icon), h('span', { class: 'nm', style: { fontSize: '12.5px', fontWeight: 400 } }, n.text, h('span', { class: 'muted' }, ' · ' + l.name)))))); }
     // electrical legend, grouped by category
     const counts = {};
     for (const l of levels) if (vis.has(l.id)) for (const s of l.symbols) counts[s.type] = (counts[s.type] || 0) + 1;
@@ -376,6 +392,8 @@ function tab3d(project, body, save) {
     ...[['＋', 'Zoom in', () => viewer.zoom(.75)], ['－', 'Zoom out', () => viewer.zoom(1.33)], ['⤢', 'Fit to screen', () => viewer.fit()]].map(([t, ti, f]) => h('button', { title: ti, onclick: f }, t)), h('div', { class: 'sep' }),
     ...[['Iso', 'iso'], ['Top', 'top'], ['Front', 'front'], ['Side', 'right']].map(([t, v]) => h('button', { title: t + ' view', style: { fontSize: '11px' }, onclick: () => viewer.fit(v) }, t)), h('div', { class: 'sep' }),
     h('button', { title: 'Auto-rotate', onclick: e => { e.currentTarget.classList.toggle('active'); viewer.autoRotate(e.currentTarget.classList.contains('active')); } }, '⟳'),
+    h('button', { title: 'Walk through the house at eye height', onclick: () => viewer.walking ? viewer.stopWalk() : (viewer.startWalk() || toast('Trace some walls first', 'err')) }, '🚶'),
+    h('button', { title: 'Export the 3D model (.glb – opens in Blender, Windows 3D viewer, …)', onclick: async () => { try { download(await viewer.exportGlb(), project.name.replace(/\W+/g, '_') + '.glb'); } catch (e) { toast('Export failed: ' + e.message, 'err'); } } }, '⬇'),
     h('button', { title: 'Save screenshot', onclick: () => fetch(viewer.snapshot()).then(r => r.blob()).then(b => download(b, project.name + '.png')) }, '📷'));
   host.append(fb);
   window.__viewer = () => viewer;
@@ -428,7 +446,7 @@ function tabEditor(project, body, save, tab, q) {
     editor = window.__editor = new Editor(canvasHost, {
       project, getImage, onChange: () => { save(); renderSteps(); },
       onSelect: () => renderProps(), onStatus: t => status.textContent = t,
-      onTool: t => { if (t === 'calibrate-ready') { showCalib(); return; } if (t === 'teach-ready') { showTeach(); return; } calibBox.style.display = 'none'; teachCard.style.display = 'none'; Object.entries(toolBtns).forEach(([k, b]) => b.classList.toggle('active', k === t)); },
+      onTool: t => { if (t === 'calibrate-ready') { showCalib(); return; } if (t === 'teach-ready') { showTeach(); return; } calibBox.style.display = 'none'; teachCard.style.display = 'none'; showHiddenCard(t); Object.entries(toolBtns).forEach(([k, b]) => b.classList.toggle('active', k === t)); },
       onLevel: l => { currentLevel = l; renderLevels(); renderSteps(); renderLevelSettings(); renderProps(); },
     });
     canvasHost.append(status, h('div', { class: 'ed-zoom' }, h('button', { title: 'Zoom in', onclick: () => editor.zoomBy(1.3) }, '＋'), h('button', { title: 'Zoom out', onclick: () => editor.zoomBy(1 / 1.3) }, '－'), h('button', { title: 'Fit', onclick: () => editor.fit() }, '⤢')));
@@ -436,6 +454,7 @@ function tabEditor(project, body, save, tab, q) {
     const first = sortedLevels(project)[0];
     if (!project.levels.length) { side.append(h('div', { class: 'banner' }, 'This project has no levels yet. Add one with “+ Level”.')); }
     editor.setLevel(q.get('level') || (first && first.id));
+    if (q.get('focus') && editor.level) { const sy = editor.level.symbols.find(x => x.id === q.get('focus')); if (sy) setTimeout(() => { editor.select({ type: 'symbol', id: sy.id, item: sy }); editor.focusOn(sy.x, sy.y, 90); }, 900); }
     editor.setTool(mode === 'elec' ? 'select' : 'select');
     editor.setUnderlay(mode === 'elec' && editor.level && editor.level.underlays.elec ? 'elec' : editor.level && editor.level.underlays.plan ? 'plan' : 'none');
     editor.underlayOpacity = mode === 'elec' ? .75 : .6;
@@ -444,8 +463,8 @@ function tabEditor(project, body, save, tab, q) {
   }
   /* toolbar */
   const tools = mode === 'plan'
-    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['sectional', '▤', 'Overhead (sectional) door'], ['dock', '🚚', 'Loading-dock door'], ['column', '▣', 'Structural column'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)'], ['measure', '📐', 'Measure a distance'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
-    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['measure', '📐', 'Measure a distance'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['teach', '🔍', 'Find look-alike symbols: box ONE example on the drawing'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)']];
+    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['sectional', '▤', 'Overhead (sectional) door'], ['dock', '🚚', 'Loading-dock door'], ['column', '▣', 'Structural column'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)'], ['measure', '📐', 'Measure a distance'], ['note', '📌', 'Pin a note (water shut-off, gas meter, hidden cable…)'], ['route', '〰', 'Draw a pipe / cable route'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
+    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['measure', '📐', 'Measure a distance'], ['note', '📌', 'Pin a note (water shut-off, gas meter, hidden cable…)'], ['route', '〰', 'Draw a pipe / cable route'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['teach', '🔍', 'Find look-alike symbols: box ONE example on the drawing'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)']];
   for (const [k, ic, tip] of tools) { const b = h('button', { title: tip, onclick: () => editor && editor.setTool(k) }, ic); toolBtns[k] = b; left.append(b); }
   left.append(h('div', { class: 'sep' }), h('button', { title: 'Undo (Ctrl+Z)', onclick: () => editor && editor.undo() }, '↶'), h('button', { title: 'Redo (Ctrl+Y)', onclick: () => editor && editor.redo() }, '↷'));
 
@@ -459,18 +478,25 @@ function tabEditor(project, body, save, tab, q) {
       h('option', { value: 'plan' }, 'Underlay: floor plan'), h('option', { value: 'elec' }, 'Underlay: situatieschema'), currentLevel && currentLevel.underlays.site ? h('option', { value: 'site' }, 'Underlay: site plan') : null, h('option', { value: 'none' }, 'Underlay: none'));
     ul.value = editor.underlay; ulSel = ul;
     levelBar.append(ul, h('label', {}, 'Opacity'), h('input', { type: 'range', min: .1, max: 1, step: .05, value: editor.underlayOpacity, style: { width: '90px' }, oninput: e => { editor.underlayOpacity = +e.target.value; editor.draw(); } }),
+      h('label', { style: { display: 'flex', gap: '4px', alignItems: 'center' } }, h('input', { type: 'checkbox', checked: editor.showNames, onchange: e => { editor.showNames = e.target.checked; editor.draw(); } }), 'Names'),
+      h('button', { class: 'small', title: 'Save what you see as a PNG image', onclick: async () => download(await editor.exportPng(), `${project.name}_${currentLevel.name}.png`.replace(/\s+/g, '_')) }, '🖼 Save image'),
       h('label', { style: { display: 'flex', gap: '4px', alignItems: 'center' } }, h('input', { type: 'checkbox', checked: editor.showBelow, onchange: e => { editor.showBelow = e.target.checked; editor.draw(); } }), 'Level below'));
   }
   let ulSel = null;
   function syncUnderlayUI() { if (ulSel && editor) ulSel.value = editor.underlay; renderSteps(); }
 
   /* side panel pieces */
-  const teachCard = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), stepsBox = h('div'), calibBox = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), lvBox = h('div'), propsBox = h('div', { class: 'props' }), actions = h('div');
+  const hiddenCard = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), teachCard = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), stepsBox = h('div'), calibBox = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), lvBox = h('div'), propsBox = h('div', { class: 'props' }), actions = h('div');
   const paletteBox = h('div');
-  side.append(stepsBox, calibBox, teachCard, actions, lvBox, propsBox);
+  side.append(stepsBox, calibBox, teachCard, hiddenCard, actions, lvBox, propsBox);
   if (mode === 'elec') side.append(paletteBox);
 
 
+  function showHiddenCard(t) {
+    hiddenCard.style.display = t === 'note' || t === 'route' ? 'block' : 'none'; hiddenCard.innerHTML = '';
+    if (t === 'note') hiddenCard.append(h('b', {}, '📌 New pin – category'), h('div', { class: 'row', style: { marginTop: '6px' } }, h('select', { onchange: e => editor.noteCat = e.target.value }, Object.entries(NOTE_CATS).map(([k, c]) => h('option', { value: k, selected: (editor.noteCat || 'other') === k }, c.icon + ' ' + c.label)))), h('div', { class: 'muted', style: { fontSize: '12px' } }, 'Click on the plan, then type what is there.'));
+    if (t === 'route') hiddenCard.append(h('b', {}, '〰 New route – what is it?'), h('div', { class: 'row', style: { marginTop: '6px' } }, h('select', { onchange: e => editor.routeKind = e.target.value }, Object.entries(ROUTE_KINDS).map(([k, c]) => h('option', { value: k, selected: (editor.routeKind || 'cable') === k }, c.label)))), h('div', { class: 'muted', style: { fontSize: '12px' } }, 'Click the corners, double-click or right-click to finish. Set the height afterwards.'));
+  }
   function showDiscover() {
     teachCard.style.display = 'block'; teachCard.innerHTML = '';
     const info = h('div', { class: 'muted' }, 'Searching the drawing…'); teachCard.append(h('b', {}, '✨ Repeated symbols found'), info);
@@ -590,6 +616,7 @@ function tabEditor(project, body, save, tab, q) {
       !l.underlays.elec && l.underlays.plan ? h('button', { class: 'small', onclick: () => uploadUnderlayModal(l, 'elec') }, '⚡ Add situatieschema') : null,
       project.levels.length > 1 ? h('button', { class: 'small danger', style: { marginTop: '6px' }, onclick: () => { if (confirm(`Remove level “${l.name}”?`)) { project.levels = project.levels.filter(x => x !== l); editor.changed(); editor.setLevel(sortedLevels(project)[0].id); } } }, 'Remove level') : null].filter(Boolean));
   }
+  const roomGridFor = l => roomGrid(l);
   /* selection properties */
   function renderProps() {
     propsBox.innerHTML = ''; if (!editor) return;
@@ -600,11 +627,14 @@ function tabEditor(project, body, save, tab, q) {
     if (s.type === 'wall') propsBox.append(h('h4', {}, 'Wall'), num('Thickness (m)', 't', .01), h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: 'level height', value: s.item.h || '', onchange: e => editor.update({ h: +e.target.value || undefined }) })), h('div', { class: 'muted' }, `Length ${wallLen(s.item).toFixed(2)} m`), del);
     if (s.type === 'opening') propsBox.append(h('h4', {}, 'Door / window'), h('div', { class: 'row' }, h('label', {}, 'Type'), h('select', { onchange: e => editor.update({ type: e.target.value }) }, ['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup'].map(t => h('option', { value: t, selected: s.item.type === t }, t)))), num('Width (m)', 'width'), num('Sill height', 'sill'), num('Height (m)', 'height'), num('Position (m)', 'pos'), s.item.detected ? h('div', { class: 'muted' }, 'Auto-detected gap – check the type.') : null, del);
     if (s.type === 'column') propsBox.append(h('h4', {}, 'Column'), num('Width (m)', 'w', .05), s.item.round ? null : num('Depth (m)', 'd', .05), num('Height (m)', 'h', .1), h('div', { class: 'row chk' }, h('label', {}, 'Round'), h('input', { type: 'checkbox', checked: !!s.item.round, onchange: e => editor.update({ round: e.target.checked }) })), h('div', { class: 'muted' }, 'Height 0 = level height.'), del);
+    if (s.type === 'note') propsBox.append(h('h4', {}, 'Note'), txt('Text', 'text'), h('div', { class: 'row' }, h('label', {}, 'Category'), h('select', { onchange: e => editor.update({ cat: e.target.value }) }, Object.entries(NOTE_CATS).map(([k, c]) => h('option', { value: k, selected: s.item.cat === k }, c.icon + ' ' + c.label)))), num('Height (m)', 'z', .1), del);
+    if (s.type === 'route') propsBox.append(h('h4', {}, 'Route'), h('div', { class: 'row' }, h('label', {}, 'Kind'), h('select', { onchange: e => editor.update({ kind: e.target.value, z: ROUTE_KINDS[e.target.value].z }) }, Object.entries(ROUTE_KINDS).map(([k, c]) => h('option', { value: k, selected: s.item.kind === k }, c.label)))), txt('Label', 'label'), num('Height (m)', 'z', .1), h('div', { class: 'muted' }, `Length ${s.item.pts.reduce((a, p, i, arr) => i ? a + Math.hypot(p[0] - arr[i - 1][0], p[1] - arr[i - 1][1]) : 0, 0).toFixed(1)} m · below floor level = negative height`), del);
     if (s.type === 'room') propsBox.append(h('h4', {}, 'Room / zone label'), txt('Name', 'text'), del);
     if (s.type === 'symbol') {
       const def = getSymbol(s.item.type);
       propsBox.append(h('h4', {}, 'Electrical symbol'), h('div', { class: 'row' }, h('div', { html: def ? svgMarkup(def, 28) : '', style: { color: '#fff' } }), h('select', { onchange: e => editor.update({ type: e.target.value }) }, allSymbols().map(d => h('option', { value: d.id, selected: d.id === s.item.type }, d.nl)))),
-        txt('Label', 'label'), txt('Circuit (breaker)', 'circuit'),
+        h('div', { class: 'row' }, h('label', {}, 'Name'), h('input', { value: s.item.label || '', placeholder: def ? shortName(def) : '', onchange: e => editor.update({ label: e.target.value }) }), h('button', { class: 'small', title: 'Suggest a name from the room and device type', onclick: () => { const g = roomGridFor(currentLevel); editor.update({ label: `${roomNameFor(currentLevel, g, s.item, def)} ${shortName(def)} ${currentLevel.symbols.filter(x => x.type === s.item.type).indexOf(s.item) + 1}` }); renderProps(); } }, '✨')),
+        txt('Circuit (breaker)', 'circuit'),
         def && (isLamp(def) || isSwitch(def)) ? txt('Switch group', 'ctl') : null, def && def.id === 'sw_double' ? txt('2nd rocker group', 'ctl2') : null, def ? h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: def.mount === 'ceiling' ? 'ceiling' : '', value: s.item.z ?? (def.mount === 'ceiling' ? '' : def.h), onchange: e => editor.update({ z: e.target.value === '' ? undefined : +e.target.value }) })) : null,
         def && def.linear ? h('div', { class: 'row' }, h('label', {}, 'Length (m)'), h('input', { type: 'number', step: .5, value: s.item.len ?? def.len, onchange: e => editor.update({ len: +e.target.value }) })) : null,
         h('div', { class: 'row' }, h('label', {}, 'Facing (°)'), h('input', { type: 'number', step: 15, value: Math.round(((s.item.angle || 0) * 180 / Math.PI) % 360), onchange: e => editor.update({ angle: +e.target.value * Math.PI / 180 }) })),
@@ -630,6 +660,62 @@ function customSymbolModal(done) {
   const m = modal(h('div', {}, h('h3', {}, 'Add your own symbol'), h('p', { class: 'muted' }, 'Upload a PNG / SVG of the icon exactly as it appears on your drawing.'), h('div', { class: 'form-row' }, h('div', {}, h('label', {}, 'Name'), name), h('div', {}, h('label', {}, 'Mounted on'), mount), h('div', {}, h('label', {}, 'Height (m)'), ht)), f, h('div', { style: { marginTop: '12px' } }, go)));
 }
 
+/* ---------------- renaming + devices table ---------------- */
+function renameModal(project, sym, level, done) {
+  const def = getSymbol(sym.type), g = roomGrid(level);
+  const sug = `${roomNameFor(level, g, sym, def)} ${shortName(def)} ${level.symbols.filter(x => x.type === sym.type).indexOf(sym) + 1}`;
+  const inp = h('input', { value: sym.label || '', placeholder: sug, style: { width: '100%' } });
+  const save = () => { sym.label = inp.value.trim(); m.close(); done(); };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+  const m = modal(h('div', { style: { width: 'min(440px,90vw)' } }, h('h3', {}, 'Rename device'), h('div', { class: 'muted', style: { marginBottom: '8px' } }, `${def.nl} · ${def.en} · ${level.name}`), inp,
+    h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'primary', onclick: save }, 'Save'), h('button', { onclick: () => { inp.value = sug; inp.focus(); } }, '✨ Suggest: ' + sug), h('button', { onclick: () => { inp.value = ''; save(); } }, 'Clear'))));
+  setTimeout(() => inp.focus(), 50);
+}
+function tabDevices(project, body, save) {
+  const wrap = h('div', { class: 'wrap', style: { width: '100%', overflow: 'auto', maxWidth: 'none' } }); body.append(wrap);
+  let q = '', lvl = '', cat = '';
+  const tbody = h('tbody'), circBox = h('div'), count = h('span', { class: 'muted' });
+  function rows() {
+    const out = [];
+    for (const lv of sortedLevels(project)) {
+      const g = roomGrid(lv);
+      for (const s of lv.symbols) { const d = getSymbol(s.type); if (!d) continue; out.push({ lv, s, d, room: roomNameFor(lv, g, s, d) }); }
+    }
+    return out;
+  }
+  function render() {
+    const all = rows(), list = all.filter(r => (!lvl || r.lv.id === lvl) && (!cat || r.d.cat === cat) && (!q || (r.s.label + ' ' + r.room + ' ' + r.d.nl + ' ' + r.d.en + ' ' + (r.s.circuit || '')).toLowerCase().includes(q.toLowerCase())));
+    count.textContent = `${list.length} of ${all.length} devices`; tbody.innerHTML = '';
+    for (const { lv, s, d, room } of list.slice(0, 600)) {
+      const nm = h('input', { value: s.label || '', placeholder: shortName(d), style: { width: '100%' }, onchange: () => { s.label = nm.value.trim(); save(); } });
+      const ci = h('input', { value: s.circuit || '', style: { width: '64px' }, onchange: () => { s.circuit = ci.value.trim(); save(); renderCircuits(); } });
+      tbody.append(h('tr', {}, h('td', { html: svgMarkup(d, 22), style: { color: '#fff', width: '34px' } }), h('td', {}, nm), h('td', {}, d.nl, h('div', { class: 'muted', style: { fontSize: '11.5px' } }, d.en)), h('td', {}, room), h('td', {}, lv.name), h('td', {}, ci),
+        h('td', { style: { whiteSpace: 'nowrap' } }, h('a', { class: 'btn small', href: `#/project/${project.id}/3d?focus=${s.id}`, title: 'Find it in the 3D model' }, '🎯 3D'), ' ', h('a', { class: 'btn small', href: `#/project/${project.id}/electrical?level=${lv.id}&focus=${s.id}`, title: 'Show it on the plan' }, '🗺 Plan'))));
+    }
+    if (list.length > 600) tbody.append(h('tr', {}, h('td', { colspan: 7, class: 'muted' }, 'Showing the first 600 – narrow the filter.')));
+    renderCircuits();
+  }
+  function renderCircuits() {
+    circBox.innerHTML = ''; project.circuitNames ||= {};
+    const circ = new Map();
+    for (const r of rows()) { const c = r.s.circuit || ''; if (!c) continue; const o = circ.get(c) || { n: 0, w: 0, rooms: new Set() }; o.n++; o.w += wattOf(r.d); o.rooms.add(r.room); circ.set(c, o); }
+    if (!circ.size) return;
+    circBox.append(h('h2', { style: { marginTop: '30px' } }, 'Circuits (breakers)'), h('p', { class: 'muted' }, 'Give each breaker a name that matches your fuse box label. Lighting load is a typical-LED estimate.'),
+      h('table', {}, h('thead', {}, h('tr', {}, ['Circuit', 'Name', 'Devices', 'Lighting load', 'Rooms'].map(t => h('th', {}, t)))), h('tbody', {}, [...circ.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true })).map(([c, o]) =>
+        h('tr', {}, h('td', {}, h('b', {}, c)), h('td', {}, h('input', { value: project.circuitNames[c] || '', placeholder: 'e.g. Kitchen sockets', style: { width: '100%' }, onchange: e => { project.circuitNames[c] = e.target.value.trim(); save(); } })), h('td', {}, o.n), h('td', {}, o.w ? o.w + ' W' : '–'), h('td', { class: 'muted' }, [...o.rooms].join(', ')))))));
+  }
+  const search = h('input', { placeholder: 'Search name, room, type or circuit…', style: { width: '280px' }, oninput: e => { q = e.target.value; render(); } });
+  const lsel = h('select', { onchange: e => { lvl = e.target.value; render(); } }, h('option', { value: '' }, 'All levels'), sortedLevels(project).map(l => h('option', { value: l.id }, l.name)));
+  const csel = h('select', { onchange: e => { cat = e.target.value; render(); } }, h('option', { value: '' }, 'All kinds'), Object.entries(CATEGORIES).map(([k, c]) => h('option', { value: k }, c.nl)));
+  wrap.append(h('h1', {}, 'Devices'), h('p', { class: 'muted', style: { maxWidth: '760px' } }, 'Every electrical device in the house. Type a name directly in the table (“Bathroom ceiling light 1”, “Garage socket 1”…), edit its circuit, or jump to it in 3D or on the plan. You can also double-click any device in the 3D view to rename it.'),
+    h('div', { class: 'form-row' }, search, lsel, csel,
+      h('button', { class: 'primary', title: 'Name every unnamed device “<room> <type> <number>”', onclick: () => { const n = autoName(project); save(); render(); toast(`Named ${n} devices`, 'ok'); } }, '✨ Auto-name unnamed'),
+      h('button', { onclick: () => { if (confirm('Replace ALL device names with fresh suggestions?')) { const n = autoName(project, { force: true }); save(); render(); toast(`Renamed ${n} devices`, 'ok'); } } }, 'Rename all'), count),
+    h('table', {}, h('thead', {}, h('tr', {}, ['', 'Name', 'Type', 'Room', 'Level', 'Circuit', ''].map(t => h('th', {}, t)))), tbody), circBox);
+  render();
+  return () => { };
+}
+
 /* ---------------- documents ---------------- */
 function tabDocs(project, body) {
   const wrap = h('div', { class: 'wrap', style: { width: '100%', overflow: 'auto' } });
@@ -651,7 +737,7 @@ async function docsView(projectId, projects) {
     for (const d of docs) {
       const pr = projects.find(p => p.id === d.projectId);
       list.append(h('tr', {}, h('td', {}, d.name), h('td', {}, h('span', { class: 'pill' }, DOC_CATS[d.category] || d.category)), h('td', {}, pr ? pr.name : '—'), h('td', {}, fmtBytes(d.size)), h('td', {}, new Date(d.created).toLocaleDateString()),
-        h('td', { style: { whiteSpace: 'nowrap' } }, h('button', { class: 'small', onclick: () => preview(d) }, 'View'), ' ', h('button', { class: 'small', onclick: () => download(d.blob, d.name) }, '⬇'), ' ', h('button', { class: 'small danger', onclick: async () => { if (confirm('Delete this document?')) { await db.del('docs', d.id); render(); } } }, '✕'))));
+        h('td', { style: { whiteSpace: 'nowrap' } }, h('button', { class: 'small', onclick: () => preview(d) }, 'View'), ' ', h('button', { class: 'small', title: 'Rename', onclick: async () => { const nm = prompt('Document name:', d.name); if (nm) { d.name = nm; await db.put('docs', d); render(); } } }, '✎'), ' ', h('button', { class: 'small', onclick: () => download(d.blob, d.name) }, '⬇'), ' ', h('button', { class: 'small danger', onclick: async () => { if (confirm('Delete this document?')) { await db.del('docs', d.id); render(); } } }, '✕'))));
     }
   }
   const list = h('tbody');

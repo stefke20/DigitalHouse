@@ -3,14 +3,18 @@ import { OrbitControls } from 'three/addons/OrbitControls.js';
 import { sortedLevels, elevations, wallExtensions, wallLen, footprintCells, projectBBox, roomGrid, roomAt } from './model.js';
 import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 import { isLamp, isSwitch } from './wiring.js';
+import { NOTE_CATS, ROUTE_KINDS } from './hidden.js';
+import { wattOf } from './naming.js';
 
+const distPt = (x, y, w) => { const dx = w.x2 - w.x1, dy = w.y2 - w.y1, l2 = dx * dx + dy * dy; let t = l2 ? ((x - w.x1) * dx + (y - w.y1) * dy) / l2 : 0; t = Math.max(0, Math.min(1, t)); return { d: Math.hypot(x - (w.x1 + t * dx), y - (w.y1 + t * dy)), t }; };
 const M = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: .85, metalness: 0, ...extra });
 
 export class Viewer {
-  constructor(container, { getImage, onLights } = {}) {
+  constructor(container, { getImage, onLights, onRename, onWalk } = {}) {
+    this.onRename = onRename || (() => { }); this.onWalk = onWalk || (() => { }); this.doors = []; this.clock = new THREE.Clock(); this.keys = new Set();
     this.el = container; this.getImage = getImage; this.onLights = onLights || (() => { });
     this.lightState = new Map(); this.lamps = []; this.switches = [];
-    this.opts = { visible: null, explode: 0, xray: false, clip: 1, roof: true, devices: true, markers: true, rooms: true, planTex: false, hiddenCats: new Set(), night: false, circuit: null, garden: true, facades: true, site: true, areas: true, sunOn: false, month: 6, hour: 15 };
+    this.opts = { visible: null, explode: 0, xray: false, clip: 1, roof: true, devices: true, markers: true, rooms: true, planTex: false, hiddenCats: new Set(), night: false, circuit: null, garden: true, facades: true, site: true, areas: true, sunOn: false, month: 6, hour: 15, hidden: true, names: false };
     const r = this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     r.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     r.shadowMap.enabled = true; r.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -41,16 +45,20 @@ export class Viewer {
     this.tip = document.createElement('div'); this.tip.className = 'tip'; this.tip.style.display = 'none'; container.append(this.tip);
     this.ray = new THREE.Raycaster(); this.mouse = new THREE.Vector2();
     r.domElement.addEventListener('pointermove', e => this.hover(e));
-    r.domElement.addEventListener('pointerdown', e => { this._down = [e.clientX, e.clientY]; });
+    r.domElement.addEventListener('dblclick', e => this.dblclick(e));
+    this._kd = e => { if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement && document.activeElement.tagName)) return; if (e.key === 'Escape' && this.walking) this.stopWalk(); this.keys.add(e.key.toLowerCase()); };
+    this._ku = e => this.keys.delete(e.key.toLowerCase()); window.addEventListener('keydown', this._kd); window.addEventListener('keyup', this._ku);
+    r.domElement.addEventListener('pointerdown', e => { this._down = [e.clientX, e.clientY]; this._look = this.walking ? [e.clientX, e.clientY] : null; });
+    r.domElement.addEventListener('pointermove', e => { if (this.walking && this._look && e.buttons) { this.walk.yaw -= (e.clientX - this._look[0]) * .004; this.walk.pitch = Math.max(-1.3, Math.min(1.3, this.walk.pitch - (e.clientY - this._look[1]) * .004)); this._look = [e.clientX, e.clientY]; } });
     r.domElement.addEventListener('pointerup', e => { if (this._down && Math.hypot(e.clientX - this._down[0], e.clientY - this._down[1]) < 5) this.click(e); this._down = null; });
     r.domElement.addEventListener('pointerleave', () => this.tip.style.display = 'none');
     this.ro = new ResizeObserver(() => this.resize()); this.ro.observe(container);
     this.alive = true; this.token = 0;
-    const loop = () => { if (!this.alive) return; this.controls.update(); r.render(this.scene, this.camera); this.raf = requestAnimationFrame(loop); };
+    const loop = () => { if (!this.alive) return; const dt = Math.min(.1, this.clock.getDelta()); this.tick(dt); if (!this.walking) this.controls.update(); r.render(this.scene, this.camera); this.raf = requestAnimationFrame(loop); };
     loop();
     this.resize();
   }
-  dispose() { this.alive = false; cancelAnimationFrame(this.raf); this.ro.disconnect(); this.renderer.dispose(); this.renderer.domElement.remove(); this.tip.remove(); }
+  dispose() { window.removeEventListener('keydown', this._kd); window.removeEventListener('keyup', this._ku); this.alive = false; cancelAnimationFrame(this.raf); this.ro.disconnect(); this.renderer.dispose(); this.renderer.domElement.remove(); this.tip.remove(); }
   resize() {
     const w = this.el.clientWidth || 300, h = this.el.clientHeight || 200;
     this.renderer.setSize(w, h, false); this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
@@ -66,7 +74,7 @@ export class Viewer {
   build() {
     const p = this.project; if (!p) return;
     const token = ++this.token;
-    this.clear(); this.lamps = []; this.switches = [];
+    this.clear(); this.lamps = []; this.switches = []; this.doors = []; this._nameCount = 0;
     const levels = sortedLevels(p), elev = elevations(p), o = this.opts;
     const xr = o.xray, clipOn = o.clip < 0.999;
     for (const k of ['wall', 'ext', 'floor', 'roof', 'frame', 'door', 'garage']) {
@@ -92,6 +100,7 @@ export class Viewer {
       if (o.rooms) this.buildRooms(g, lv, e);
       this.buildSlab(g, lv, e, lv.id === topId);
       if (o.devices) this.buildDevices(g, lv, e);
+      if (o.hidden) this.buildHidden(g, lv, e);
       if (o.planTex && this.getImage && lv.underlays.plan) this.addPlanTexture(g, lv, e, token);
       this.root.add(g);
     });
@@ -245,8 +254,14 @@ export class Viewer {
           this.box(g, mats.frame, f, op.height, t * .7, w.x1 + dx * (s + f / 2), e + sill + op.height / 2, w.y1 + dy * (s + f / 2), ry);
           this.box(g, mats.frame, f, op.height, t * .7, w.x1 + dx * (en - f / 2), e + sill + op.height / 2, w.y1 + dy * (en - f / 2), ry);
           this.box(g, mats.frame, ow - .08, .03, t * .9, cx, e + sill - .015, cz, ry);
-        } else if (op.type === 'door' || op.type === 'garage') {
-          this.box(g, op.type === 'door' ? mats.door : mats.garage, ow - .06, op.height - .03, .045, cx, e + (op.height - .03) / 2 + .01, cz, ry);
+        } else if (op.type === 'door') { // hinged leaf – click it in 3D to open / close
+          const hinge = new THREE.Group(); hinge.position.set(w.x1 + dx * s, e + .01, w.y1 + dy * s); hinge.rotation.y = ry;
+          const leaf = new THREE.Mesh(new THREE.BoxGeometry(ow - .06, op.height - .03, .045), mats.door); leaf.position.set(ow / 2, (op.height - .03) / 2, 0); leaf.castShadow = leaf.receiveShadow = true;
+          const hnd = new THREE.Mesh(new THREE.SphereGeometry(.025, 8, 8), mats.metal); hnd.position.set(ow - .12, (op.height - .03) / 2 * .95, .04); leaf.add(hnd);
+          const cx0 = (this.bb.x0 + this.bb.x1) / 2 - cx, cz0 = (this.bb.y0 + this.bb.y1) / 2 - cz, sgn = (cx0 * -Math.sin(ry) + cz0 * -Math.cos(ry)) > 0 ? 1 : -1;
+          const rec = { hinge, ry, sgn, open: 0, target: 0 }; leaf.userData.doorIdx = this.doors.length; hinge.add(leaf); g.add(hinge); this.doors.push(rec); this.pickables.push(leaf);
+        } else if (op.type === 'garage') {
+          this.box(g, mats.garage, ow - .06, op.height - .03, .045, cx, e + (op.height - .03) / 2 + .01, cz, ry);
         } else if (op.type === 'sectional' || op.type === 'rollup' || op.type === 'dock') {
           const lm = op.type === 'dock' ? mats.dockdoor : mats.industrial, hh = op.height - .04, y0 = e + sill + .02;
           const panels = Math.max(2, Math.round(hh / .6));
@@ -316,7 +331,7 @@ export class Viewer {
       grp.add(dev);
       const lampLike = isLamp(def), swLike = isSwitch(def);
       if (lampLike || swLike) { // generous invisible click target
-        const hit = new THREE.Mesh(new THREE.BoxGeometry(.3, .3, .3), new THREE.MeshBasicMaterial({ visible: false })); hit.position.set(0, lampLike && def.mount === 'ceiling' ? -.1 : 0, .06); grp.add(hit);
+        const hit = new THREE.Mesh(new THREE.BoxGeometry(.3, .3, .3), new THREE.MeshBasicMaterial({ visible: false })); hit.visible = false; hit.position.set(0, lampLike && def.mount === 'ceiling' ? -.1 : 0, .06); grp.add(hit);
       }
       let lampRec = null;
       if (lampLike) { // own materials so each lamp can light up independently
@@ -332,6 +347,7 @@ export class Viewer {
       grp.rotation.y = mount === 'ceiling' ? -ang : Math.atan2(Math.cos(ang), Math.sin(ang));
       grp.userData = { sym: s, def, level: lv };
       g.add(grp); this.pickables.push(grp);
+      if (this.opts.names && s.label && this._nameCount++ < 150) { const sp = this.labelSprite(s.label, .16 * this.k); sp.position.set(s.x, y + (mount === 'ceiling' ? -.55 : .55) * this.k, s.y); g.add(sp); }
       if (lampRec) {
         const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTexture(), color: 0xffd9a0, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
         const gs = (def.model === 'tube' ? 1.6 : def.model === 'highbay' ? 2.6 : def.model === 'spot' ? .7 : 1.2) * Math.min(2.5, this.k);
@@ -403,6 +419,113 @@ export class Viewer {
     return g;
   }
 
+
+  /* ---------- labels, hidden installations ---------- */
+  labelSprite(text, h = .2) {
+    this._lt = this._lt || new Map();
+    let tex = this._lt.get(text);
+    if (!tex) {
+      const c = document.createElement('canvas'); c.width = 512; c.height = 64; const x = c.getContext('2d');
+      x.font = '600 34px Inter, Arial, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+      const w = Math.min(500, x.measureText(text).width + 28); x.fillStyle = 'rgba(11,18,32,.85)'; x.beginPath(); x.roundRect((512 - w) / 2, 6, w, 52, 12); x.fill();
+      x.fillStyle = '#fff'; x.fillText(text, 256, 33, 470); tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.userData = { w: w / 512 }; this._lt.set(text, tex);
+    }
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false })); sp.scale.set(h * 8 * tex.userData.w + .01, h, 1); sp.renderOrder = 8; sp.raycast = () => { }; return sp;
+  }
+  noteTexture(cat) {
+    this._nt = this._nt || new Map(); if (this._nt.has(cat)) return this._nt.get(cat);
+    const c = document.createElement('canvas'); c.width = c.height = 128; const x = c.getContext('2d'), info = NOTE_CATS[cat] || NOTE_CATS.other;
+    x.fillStyle = '#0b1220'; x.beginPath(); x.arc(64, 64, 58, 0, 7); x.fill(); x.lineWidth = 9; x.strokeStyle = info.color; x.stroke(); x.font = '64px sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(info.icon, 64, 70);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; this._nt.set(cat, t); return t;
+  }
+  buildHidden(g, lv, e) {
+    this._rm = this._rm || new Map();
+    for (const r of lv.routes || []) {
+      const k = ROUTE_KINDS[r.kind] || ROUTE_KINDS.cable; let mat = this._rm.get(r.kind); if (!mat) { mat = new THREE.MeshStandardMaterial({ color: k.color, roughness: .5, metalness: .2 }); this._rm.set(r.kind, mat); }
+      const y = e + (r.z ?? k.z), rad = k.r * Math.min(2.5, this.k);
+      for (let i = 0; i + 1 < r.pts.length; i++) {
+        const a = new THREE.Vector3(r.pts[i][0], y, r.pts[i][1]), b = new THREE.Vector3(r.pts[i + 1][0], y, r.pts[i + 1][1]), L = a.distanceTo(b); if (L < .01) continue;
+        const m = new THREE.Mesh(new THREE.CylinderGeometry(rad, rad, L, 8), mat); m.position.copy(a).add(b).multiplyScalar(.5); m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.clone().sub(a).normalize()); g.add(m);
+        const j = new THREE.Mesh(new THREE.SphereGeometry(rad, 8, 6), mat); j.position.copy(a); g.add(j);
+        if (i + 2 === r.pts.length) { const j2 = j.clone(); j2.position.copy(b); g.add(j2); }
+      }
+    }
+    for (const n of lv.notes || []) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.noteTexture(n.cat), transparent: true, depthTest: false })); sp.scale.set(.38 * this.k, .38 * this.k, 1); sp.position.set(n.x, e + (n.z ?? 1.2), n.y); sp.renderOrder = 9;
+      sp.userData = { note: n, level: lv }; g.add(sp); this.pickables.push(sp);
+    }
+  }
+  /* ---------- doors, walking, focus ---------- */
+  tick(dt) {
+    for (const d of this.doors) { if (Math.abs(d.target - d.open) > .002) { d.open += (d.target - d.open) * Math.min(1, dt * 7); d.hinge.rotation.y = d.ry + d.sgn * d.open; } }
+    if (this.pulse) { const t = (performance.now() - this.pulse.t0) / 1000; if (t > 3.5) { this.pulse.sp.parent && this.pulse.sp.parent.remove(this.pulse.sp); this.pulse = null; } else { const s = (.6 + .5 * Math.abs(Math.sin(t * 4))) * this.k; this.pulse.sp.scale.set(s, s, 1); this.pulse.sp.material.opacity = Math.max(0, 1 - t / 3.5); } }
+    if (this.walking) this.updateWalk(dt);
+  }
+  blocked(x, y) {
+    const lv = this.walk.lv;
+    for (const w of lv.walls) {
+      const r = distPt(x, y, w); if (r.d >= w.t / 2 + .22) continue;
+      const along = r.t * wallLen(w); let pass = false;
+      for (const o of lv.openings) if (o.wallId === w.id && o.type !== 'window' && Math.abs(along - o.pos) < o.width / 2) { pass = true; break; }
+      if (!pass) return true;
+    }
+    for (const c of lv.columns || []) if (Math.abs(c.x - x) < c.w / 2 + .25 && Math.abs(c.y - y) < (c.d || c.w) / 2 + .25) return true;
+    return false;
+  }
+  startWalk(levelId) {
+    const p = this.project, els = elevations(p), levels = sortedLevels(p).filter(l => l.walls.length);
+    const lv = levels.find(l => l.id === levelId) || levels.find(l => l.order >= 0) || levels[0]; if (!lv) return false;
+    const g = roomGrid(lv); let best = null; if (g) for (const r of g.rooms.values()) if (!r.exterior && (!best || r.area > best.area)) best = r;
+    const sx = best ? best.cx : (this.bb.x0 + this.bb.x1) / 2, sy = best ? best.cy : (this.bb.y0 + this.bb.y1) / 2;
+    this._orbit = { pos: this.camera.position.clone(), tgt: this.controls.target.clone(), fov: this.camera.fov };
+    this.walk = { lv, x: sx, z: sy, eye: els[lv.id] + 1.65, yaw: Math.PI / 2, pitch: -.05 }; this.walking = true; this.controls.enabled = false;
+    this.camera.fov = 75; this.camera.near = .05; this.camera.updateProjectionMatrix(); this.camera.rotation.order = 'YXZ'; this.updateWalk(0);
+    this.onWalk(true, lv); return true;
+  }
+  stopWalk() {
+    if (!this.walking) return; this.walking = false; this.controls.enabled = true; const o = this._orbit;
+    this.camera.fov = o.fov; this.camera.near = .1; this.camera.updateProjectionMatrix(); this.camera.rotation.order = 'XYZ'; this.camera.position.copy(o.pos); this.controls.target.copy(o.tgt); this.controls.update(); this.onWalk(false);
+  }
+  updateWalk(dt) {
+    const w = this.walk, k = this.keys, sp = (k.has('shift') ? 4.4 : 2.2) * dt;
+    const fwd = (k.has('w') || k.has('arrowup') ? 1 : 0) - (k.has('s') || k.has('arrowdown') ? 1 : 0), str = (k.has('d') ? 1 : 0) - (k.has('a') ? 1 : 0);
+    if (k.has('arrowleft')) w.yaw += 1.6 * dt; if (k.has('arrowright')) w.yaw -= 1.6 * dt;
+    if (fwd || str) {
+      const fx = -Math.sin(w.yaw), fz = -Math.cos(w.yaw), rx = Math.cos(w.yaw), rz = -Math.sin(w.yaw), nx = w.x + (fx * fwd + rx * str) * sp, nz = w.z + (fz * fwd + rz * str) * sp;
+      if (!this.blocked(nx, w.z)) w.x = nx; if (!this.blocked(w.x, nz)) w.z = nz;
+    }
+    this.camera.position.set(w.x, w.eye, w.z); this.camera.rotation.set(w.pitch, w.yaw, 0);
+  }
+  focusSymbol(id) {
+    for (const o of this.pickables) {
+      if (!o.userData.sym || o.userData.sym.id !== id || !o.isGroup) continue;
+      const p = o.getWorldPosition(new THREE.Vector3()), off = Math.max(2.4, 2 * this.k);
+      this.controls.target.copy(p); this.camera.position.set(p.x + off, p.y + off * .55, p.z + off); this.controls.update();
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowTexture(), color: 0xff4d6d, transparent: true, depthTest: false, blending: THREE.AdditiveBlending })); sp.position.copy(p); sp.renderOrder = 20; sp.raycast = () => { }; this.scene.add(sp); this.pulse = { sp, t0: performance.now() }; return true;
+    }
+    return false;
+  }
+  dblclick(e) {
+    const hit = this.pick(e);
+    if (hit && hit.def) this.onRename(hit.sym, hit.level);
+  }
+  pick(e) {
+    if (!this.pickables || !this.pickables.length) return null;
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(this.mouse, this.camera);
+    for (const h of this.ray.intersectObjects(this.pickables, true)) { let o = h.object; while (o && !o.userData.def && !o.userData.note && o.userData.doorIdx === undefined) o = o.parent; if (o) return o.userData.doorIdx !== undefined ? { door: this.doors[o.userData.doorIdx], obj: o } : { ...o.userData, point: h.point, obj: o }; }
+    return null;
+  }
+  focusPoint(x, y, z) { const p = new THREE.Vector3(x, z, y), off = Math.max(2.6, 2 * this.k); this.controls.target.copy(p); this.camera.position.set(p.x + off, p.y + off * .6, p.z + off); this.controls.update(); }
+  lightLoad() { let w = 0; for (const l of this.lamps) w += wattOf(l.def) * this.groupLevel(l.key); return Math.round(w); }
+  async exportGlb() {
+    const { GLTFExporter } = await import('three/addons/GLTFExporter.js'), ex = new GLTFExporter();
+    const saved = []; this.root.traverse(o => { saved.push([o, o.userData]); o.userData = {}; }); // pick data must not end up in the file
+    const hidden = []; this.root.traverse(o => { if (o.isSprite) { hidden.push(o); o.visible = false; } });
+    try { return await new Promise((res, rej) => ex.parse(this.root, g => res(new Blob([g], { type: 'model/gltf-binary' })), rej, { binary: true, onlyVisible: true })); }
+    finally { for (const [o, u] of saved) o.userData = u; for (const o of hidden) o.visible = true; }
+  }
   /* ---------- lighting simulation ---------- */
   glowTexture() {
     if (this._glow) return this._glow;
@@ -419,7 +542,7 @@ export class Viewer {
     const out = new Map();
     for (const l of this.lamps) {
       const k = l.key; let o = out.get(k);
-      if (!o) { const ctl = l.s.ctl || ''; o = { key: k, levelId: l.level.id, ctl, count: 0, levelName: l.level.name, name: ctl ? (l.level.groupNames && l.level.groupNames[ctl]) || ctl : 'Lights without a switch', dimmer: false }; out.set(k, o); }
+      if (!o) { const ctl = l.s.ctl || ''; o = { key: k, levelId: l.level.id, ctl, count: 0, levelName: l.level.name, name: (l.level.groupNames && l.level.groupNames[ctl]) || (ctl || 'Lights without a switch'), dimmer: false }; out.set(k, o); }
       o.count++;
     }
     for (const lv of this.project.levels) for (const s of lv.symbols) if (s.type === 'sw_dimmer') { const o = out.get(lv.id + '|' + (s.ctl || '')); if (o) o.dimmer = true; }
@@ -472,34 +595,29 @@ export class Viewer {
     const c = Math.cos(el); return { x: Math.sin(az) * c, y: Math.sin(el), z: -Math.cos(az) * c, el, az };
   }
   click(e) {
-    if (!this.pickables || !this.pickables.length) return;
-    const r = this.renderer.domElement.getBoundingClientRect();
-    this.mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
-    this.ray.setFromCamera(this.mouse, this.camera);
-    for (const h of this.ray.intersectObjects(this.pickables, true)) {
-      let o = h.object; while (o && !o.userData.def) o = o.parent;
-      if (!o) continue;
-      const { sym, def, level } = o.userData;
-      if (isSwitch(def) || isLamp(def)) {
-        let ctl = sym.ctl || '';
-        if (def.id === 'sw_double' && sym.ctl2 && o.isGroup) { const p = o.worldToLocal(h.point.clone()); if (p.y < 0) ctl = sym.ctl2; }
-        this.toggleGroup(level.id, ctl); return;
-      }
+    if (this.walking && this._look && this._down && Math.hypot(e.clientX - this._down[0], e.clientY - this._down[1]) >= 5) return;
+    const h = this.pick(e); if (!h) return;
+    if (h.door) { h.door.target = h.door.target > 0 ? 0 : 1.45; return; }
+    if (h.note || !h.def) return;
+    const { sym, def, level } = h;
+    if (isSwitch(def) || isLamp(def)) {
+      let ctl = sym.ctl || '';
+      if (def.id === 'sw_double' && sym.ctl2 && h.obj.isGroup) { const p = h.obj.worldToLocal(h.point.clone()); if (p.y < 0) ctl = sym.ctl2; }
+      this.toggleGroup(level.id, ctl);
     }
   }
   hover(e) {
-    if (!this.pickables || !this.pickables.length) return;
-    const r = this.renderer.domElement.getBoundingClientRect();
-    this.mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
-    this.ray.setFromCamera(this.mouse, this.camera);
-    const hits = this.ray.intersectObjects(this.pickables, true);
-    let hit = null;
-    for (const h of hits) { let o = h.object; while (o && !o.userData.def) o = o.parent; if (o) { hit = o; break; } }
-    if (!hit) { this.tip.style.display = 'none'; return; }
-    const { sym, def, level } = hit.userData;
-    const clickable = isSwitch(def) || isLamp(def);
-    this.tip.innerHTML = `<b>${def.nl}</b>${clickable ? ' <span style="color:#fbbf24">· click to switch</span>' : ''}<br><span style="color:#93a1bd">${def.en} · ${level.name}${sym.label ? ' · ' + sym.label : ''}${sym.circuit ? ' · kring ' + sym.circuit : ''}</span>`;
-    this.tip.style.display = 'block';
+    const h = this.pick(e), r = this.renderer.domElement.getBoundingClientRect();
+    if (!h) { this.tip.style.display = 'none'; this.renderer.domElement.style.cursor = ''; return; }
+    let html = '';
+    if (h.door) html = '<b>Door</b> <span style="color:#fbbf24">· click to open / close</span>';
+    else if (h.note) { const c = NOTE_CATS[h.note.cat] || NOTE_CATS.other; html = `<b>${c.icon} ${c.label}</b><br>${h.note.text}<br><span style="color:#93a1bd">${h.level.name}</span>`; }
+    else if (h.def) {
+      const { sym, def, level } = h, clickable = isSwitch(def) || isLamp(def), cn = this.project.circuitNames && this.project.circuitNames[sym.circuit];
+      html = `<b>${sym.label || def.nl}</b>${clickable ? ' <span style="color:#fbbf24">· click to switch</span>' : ''}<br><span style="color:#93a1bd">${def.nl} · ${def.en} · ${level.name}${sym.circuit ? ' · circuit ' + sym.circuit + (cn ? ' (' + cn + ')' : '') : ''}${wattOf(def) ? ' · ~' + wattOf(def) + ' W' : ''}<br>double-click to rename</span>`;
+    }
+    this.renderer.domElement.style.cursor = h.door || (h.def && (isSwitch(h.def) || isLamp(h.def))) ? 'pointer' : '';
+    this.tip.innerHTML = html; this.tip.style.display = 'block';
     this.tip.style.left = (e.clientX - r.left + 14) + 'px'; this.tip.style.top = (e.clientY - r.top + 14) + 'px';
   }
 

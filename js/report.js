@@ -1,5 +1,6 @@
 import { computeStats, symbolInventory } from './stats.js';
 import { CATEGORIES } from './symbols.js';
+import { NOTE_CATS, ROUTE_KINDS } from './hidden.js';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const f1 = n => n.toFixed(1);
 
@@ -25,7 +26,9 @@ table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border-bottom:1px 
 ${warn.length ? `<p class="warn">⚠ ${warn.map(esc).join(' · ')}</p>` : ''}
 <h2>Levels and rooms</h2>${lv.map(l => `<h3>${esc(l.name)} – ${f1(l.area)} m², ceiling height ${l.height} m</h3><table><tr><th>Room</th><th class="n">Area m²</th><th class="n">Window area m²</th><th class="n">Daylight (window/floor)</th></tr>${l.rooms.map(r => `<tr><td>${esc(r.name)}</td><td class="n">${f1(r.area)}</td><td class="n">${f1(r.windowArea)}</td><td class="n">${r.windowArea ? Math.round(r.daylight * 100) + ' %' : '–'}</td></tr>`).join('') || '<tr><td colspan="4">No closed rooms detected</td></tr>'}</table>`).join('')}
 <h2>Electrical installation</h2><table><tr><th>Symbol</th><th>English</th>${lv.map(l => `<th class="n">${esc(l.name)}</th>`).join('')}<th class="n">Total</th></tr>${[...types.values()].sort((a, b) => b.n - a.n).map(t => `<tr><td>${esc(t.nl)}</td><td>${esc(t.en)}</td>${lv.map(l => `<td class="n">${t.per[l.name] || ''}</td>`).join('')}<td class="n"><b>${t.n}</b></td></tr>`).join('') || '<tr><td colspan="9">No symbols placed yet</td></tr>'}</table>
-<h2>Circuits (breakers)</h2><table><tr><th>Circuit</th><th class="n">Devices</th><th>Rooms</th><th>What</th></tr>${[...circ.entries()].sort().map(([c, o]) => `<tr><td>${esc(c)}</td><td class="n">${o.n}</td><td>${esc([...o.rooms].join(', '))}</td><td>${esc(Object.entries(o.items).map(([k, n]) => n + '× ' + k).join(', '))}</td></tr>`).join('') || '<tr><td colspan="4">No circuits assigned</td></tr>'}</table>
+<h2>Circuits (breakers)</h2><table><tr><th>Circuit</th><th>Name</th><th class="n">Devices</th><th>Rooms</th><th>What</th></tr>${[...circ.entries()].sort().map(([c, o]) => `<tr><td>${esc(c)}</td><td>${esc((project.circuitNames || {})[c] || '')}</td><td class="n">${o.n}</td><td>${esc([...o.rooms].join(', '))}</td><td>${esc(Object.entries(o.items).map(([k, n]) => n + '× ' + k).join(', '))}</td></tr>`).join('') || '<tr><td colspan="5">No circuits assigned</td></tr>'}</table>
+${inv.length ? `<h2>Device list</h2><table><tr><th>Name</th><th>Type</th><th>Room</th><th>Level</th><th>Circuit</th></tr>${inv.slice(0, 500).map(r => `<tr><td>${esc(r.label || '–')}</td><td>${esc(r.nl)}</td><td>${esc(r.room)}</td><td>${esc(r.level)}</td><td>${esc(r.circuit)}</td></tr>`).join('')}</table>` : ''}
+${project.levels.some(l => (l.notes || []).length || (l.routes || []).length) ? `<h2>Hidden installations &amp; notes</h2><table><tr><th>Level</th><th>Kind</th><th>Note</th></tr>${project.levels.flatMap(l => [...(l.notes || []).map(n => `<tr><td>${esc(l.name)}</td><td>${esc((NOTE_CATS[n.cat] || NOTE_CATS.other).label)}</td><td>${esc(n.text)}</td></tr>`), ...(l.routes || []).map(r => `<tr><td>${esc(l.name)}</td><td>${esc(ROUTE_KINDS[r.kind].label)}</td><td>${esc(r.label || '')} (${r.pts.reduce((a, p, i, arr) => i ? a + Math.hypot(p[0] - arr[i - 1][0], p[1] - arr[i - 1][1]) : 0, 0).toFixed(1)} m at ${r.z} m)</td></tr>`)]).join('')}</table>` : ''}
 <p style="color:#6b7280;margin-top:30px">Areas are derived from the traced walls, so they are only as accurate as the plan scale. Not an official measurement or compliance document.</p>
 </body></html>`;
 }

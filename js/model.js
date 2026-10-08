@@ -23,7 +23,7 @@ export function newLevel(preset = LEVEL_PRESETS[1], extra = {}) {
   return {
     id: uid('lv'), kind: preset.kind, name: preset.name, order: preset.order, height: preset.height, slab: preset.slab || 0.25,
     underlays: {}, // plan / elec : {docId,w,h,pxPerM,ox,oy,calibrated,paperPxPerMm}
-    walls: [], openings: [], symbols: [], columns: [], rooms: [], ...extra,
+    walls: [], openings: [], symbols: [], columns: [], rooms: [], notes: [], routes: [], ...extra,
   };
 }
 export function newProject(name) {
@@ -146,7 +146,8 @@ export function projectBBox(p) {
 export function normalizeProject(p) {
   p.settings = { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8, garden: true, ...(p.settings || {}) };
   p.facades ||= {};
-  for (const l of p.levels) { l.columns ||= []; l.rooms ||= []; }
+  for (const l of p.levels) { l.columns ||= []; l.rooms ||= []; l.notes ||= []; l.routes ||= []; }
+  p.circuitNames ||= {};
   return p;
 }
 
