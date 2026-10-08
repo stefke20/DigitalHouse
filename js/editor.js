@@ -2,10 +2,12 @@ import { uid, clamp } from './util.js';
 import { wallExtensions, wallLen, distPtSeg } from './model.js';
 import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 import { detectWalls } from './detect.js';
+import { findSimilar } from './match.js';
 
 export const OPENING_DEFAULTS = {
   door: { width: .9, sill: 0, height: 2.05 }, window: { width: 1.2, sill: .9, height: 1.3 },
   opening: { width: 1.5, sill: 0, height: 2.1 }, garage: { width: 2.4, sill: 0, height: 2.1 },
+  sectional: { width: 4, sill: 0, height: 4.2 }, dock: { width: 2.5, sill: 1.2, height: 2.8 }, rollup: { width: 3, sill: 0, height: 3.5 },
 };
 
 export class Editor {
@@ -53,9 +55,9 @@ export class Editor {
   setSymbol(id) { this.symbolId = id; this.setTool('symbol'); }
   setUnderlay(k) { this.underlay = k; this.draw(); }
   changed() { this.project.updated = Date.now(); this.cb.onChange(); }
-  snapshot() { const l = this.level; return JSON.stringify({ id: l.id, walls: l.walls, openings: l.openings, symbols: l.symbols, underlays: l.underlays }); }
+  snapshot() { const l = this.level; return JSON.stringify({ id: l.id, walls: l.walls, openings: l.openings, symbols: l.symbols, columns: l.columns, rooms: l.rooms, underlays: l.underlays }); }
   pushUndo() { if (!this.level) return; this.undoStack.push(this.snapshot()); if (this.undoStack.length > 60) this.undoStack.shift(); this.redoStack = []; }
-  restore(s) { const o = JSON.parse(s), l = this.project.levels.find(x => x.id === o.id); if (!l) return; Object.assign(l, { walls: o.walls, openings: o.openings, symbols: o.symbols, underlays: o.underlays }); this.sel = null; this.cb.onSelect(null); this.changed(); this.draw(); }
+  restore(s) { const o = JSON.parse(s), l = this.project.levels.find(x => x.id === o.id); if (!l) return; Object.assign(l, { walls: o.walls, openings: o.openings, symbols: o.symbols, columns: o.columns || [], rooms: o.rooms || [], underlays: o.underlays }); this.sel = null; this.cb.onSelect(null); this.changed(); this.draw(); }
   undo() { if (!this.undoStack.length) return; this.redoStack.push(this.snapshot()); this.restore(this.undoStack.pop()); }
   redo() { if (!this.redoStack.length) return; this.undoStack.push(this.snapshot()); this.restore(this.redoStack.pop()); }
 
@@ -118,6 +120,8 @@ export class Editor {
   hit(wx, wy) {
     const l = this.level, px = 1 / this.view.s;
     for (let i = l.symbols.length - 1; i >= 0; i--) { const s = l.symbols[i]; if (Math.hypot(s.x - wx, s.y - wy) < Math.max(.2, 10 * px)) return { type: 'symbol', id: s.id, item: s }; }
+    for (const r of l.rooms) { if (Math.abs(r.x - wx) < Math.max(.5, r.text.length * 6 / this.view.s) && Math.abs(r.y - wy) < Math.max(.25, 9 / this.view.s)) return { type: 'room', id: r.id, item: r }; }
+    for (const c of l.columns) { if (Math.abs(c.x - wx) <= c.w / 2 + 4 * px && Math.abs(c.y - wy) <= (c.d || c.w) / 2 + 4 * px) return { type: 'column', id: c.id, item: c }; }
     for (const o of l.openings) {
       const w = l.walls.find(x => x.id === o.wallId); if (!w) continue;
       const L = wallLen(w), ux = (w.x2 - w.x1) / L, uy = (w.y2 - w.y1) / L;
@@ -135,6 +139,8 @@ export class Editor {
     if (type === 'wall') { l.walls = l.walls.filter(w => w.id !== id); l.openings = l.openings.filter(o => o.wallId !== id); }
     if (type === 'opening') l.openings = l.openings.filter(o => o.id !== id);
     if (type === 'symbol') l.symbols = l.symbols.filter(s => s.id !== id);
+    if (type === 'column') l.columns = l.columns.filter(c => c.id !== id);
+    if (type === 'room') l.rooms = l.rooms.filter(c => c.id !== id);
     this.select(null); this.changed();
   }
   update(patch) { if (!this.sel) return; this.pushUndo(); Object.assign(this.sel.item, patch); this.changed(); this.draw(); }
@@ -162,12 +168,21 @@ export class Editor {
       else {
         if (Math.hypot(p[0] - this.drawing.x, p[1] - this.drawing.y) > .05) {
           this.pushUndo();
-          const nw = { id: uid('w'), x1: this.drawing.x, y1: this.drawing.y, x2: p[0], y2: p[1], t: this.defaultT || .2 };
+          const nw = { id: uid('w'), x1: this.drawing.x, y1: this.drawing.y, x2: p[0], y2: p[1], t: this.defaultT || (this.project.settings.type === 'industrial' ? .3 : .2) };
           this.level.walls.push(nw); this.changed(); this.select({ type: 'wall', id: nw.id, item: nw });
           this.drawing = { x: p[0], y: p[1] };
         }
       }
-    } else if (['door', 'window', 'opening', 'garage'].includes(t)) {
+    } else if (t === 'column') {
+      this.pushUndo(); const sz = this.project.settings.type === 'industrial' ? .5 : .3;
+      const c = { id: uid('c'), x: Math.round(wx / .05) * .05, y: Math.round(wy / .05) * .05, w: sz, d: sz, round: false };
+      this.level.columns.push(c); this.changed(); this.select({ type: 'column', id: c.id, item: c });
+    } else if (t === 'room') {
+      const text = prompt('Room / zone name:'); if (text) { this.pushUndo(); const r = { id: uid('r'), text, x: wx, y: wy }; this.level.rooms.push(r); this.changed(); this.select({ type: 'room', id: r.id, item: r }); }
+    } else if (t === 'teach') {
+      const u = this.level.underlays[this.underlay]; if (!u) return;
+      this.drag = { kind: 'teach', a: [wx, wy], b: [wx, wy] };
+    } else if (['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup'].includes(t)) {
       const n = this.nearestWall(wx, wy, .5);
       if (n) {
         const d = OPENING_DEFAULTS[t]; this.pushUndo();
@@ -200,6 +215,7 @@ export class Editor {
     if (d) {
       if (d.kind === 'pan') { this.view.cx = d.cx - (sx - d.sx) / this.view.s; this.view.cy = d.cy - (sy - d.sy) / this.view.s; }
       else if (d.kind === 'end') { const p = this.snapPt(wx, wy, { noGrid: e.altKey }); d.w['x' + d.k] = p[0]; d.w['y' + d.k] = p[1]; this.changed(); }
+      else if (d.kind === 'teach') { d.b = [wx, wy]; }
       else if (d.kind === 'ul') { d.u.ox = d.ox + wx - d.wx; d.u.oy = d.oy + wy - d.wy; }
       else if (d.kind === 'lvl') { this.shiftLevel(wx - d.last[0], wy - d.last[1]); d.last = [wx, wy]; }
       else if (d.kind === 'move') {
@@ -209,6 +225,8 @@ export class Editor {
         if (d.h.type === 'symbol') {
           const def = getSymbol(it.type), sn = def && def.mount === 'wall' ? this.wallSnapForSymbol(wx, wy) : null;
           if (sn) { it.x = sn.x; it.y = sn.y; it.angle = sn.angle; } else { it.x = Math.round((d.orig.x + dx) / .05) * .05; it.y = Math.round((d.orig.y + dy) / .05) * .05; }
+        } else if (d.h.type === 'column' || d.h.type === 'room') {
+          it.x = Math.round((d.orig.x + dx) / .05) * .05; it.y = Math.round((d.orig.y + dy) / .05) * .05;
         } else if (d.h.type === 'wall') {
           const sx2 = Math.round(dx / .05) * .05, sy2 = Math.round(dy / .05) * .05;
           it.x1 = d.orig.x1 + sx2; it.x2 = d.orig.x2 + sx2; it.y1 = d.orig.y1 + sy2; it.y2 = d.orig.y2 + sy2;
@@ -220,12 +238,13 @@ export class Editor {
       }
       this.draw(); return;
     }
-    if (['door', 'window', 'opening', 'garage', 'symbol', 'wall', 'calibrate', 'erase', 'select'].includes(this.tool)) this.draw();
+    if (['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup', 'symbol', 'wall', 'calibrate', 'erase', 'select', 'column'].includes(this.tool)) this.draw();
     this.status();
   }
   pup(e) {
     if (this.drag) {
       const k = this.drag.kind;
+      if (k === 'teach') { const { a, b } = this.drag; this.drag = null; this.teachBox = { x0: Math.min(a[0], b[0]), y0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), y1: Math.max(a[1], b[1]) }; this.draw(); if (this.teachBox.x1 - this.teachBox.x0 > .05) this.cb.onTool('teach-ready'); return; }
       if (['move', 'end', 'ul', 'lvl'].includes(k)) { if (k !== 'move' || this.drag.moved) this.changed(); }
       this.drag = null; this.canvas.style.cursor = this.tool === 'pan' ? 'grab' : this.tool === 'select' ? 'default' : 'crosshair';
     }
@@ -252,11 +271,12 @@ export class Editor {
     const l = this.level;
     for (const w of l.walls) { w.x1 += dx; w.x2 += dx; w.y1 += dy; w.y2 += dy; }
     for (const s of l.symbols) { s.x += dx; s.y += dy; }
+    for (const s of [...l.columns, ...l.rooms]) { s.x += dx; s.y += dy; }
     for (const u of Object.values(l.underlays)) { u.ox += dx; u.oy += dy; }
   }
   status() {
     const { wx, wy } = this.mouse;
-    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
+    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', sectional: 'Click on an outer wall to place an overhead (sectional) door', dock: 'Click on a wall to place a loading-dock door', rollup: 'Click on a wall to place a roller shutter', column: 'Click to place a structural column', room: 'Click to name a room / zone', teach: 'Drag a box around ONE example symbol on the drawing', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
     this.cb.onStatus(`${wx.toFixed(2)} m, ${wy.toFixed(2)} m  ·  ${hints[this.tool] || ''}`);
   }
 
@@ -277,13 +297,45 @@ export class Editor {
     const u = this.level.underlays.plan; if (!u) throw new Error('No floor plan uploaded for this level');
     if (!u.calibrated) throw new Error('Set the scale first (Calibrate tool)');
     await this.loadBitmaps();
-    const res = detectWalls(this.bitmaps[u.docId], u.pxPerM);
+    const res = detectWalls(this.bitmaps[u.docId], u.pxPerM, { industrial: this.project.settings.type === 'industrial' });
     this.pushUndo();
     for (const w of res.walls) { w.x1 += u.ox; w.x2 += u.ox; w.y1 += u.oy; w.y2 += u.oy; }
     this.level.walls = res.walls; this.level.openings = res.openings;
     this.level.detected = true; this.select(null); this.changed(); this.draw();
     return res;
   }
+  /* teach-by-example symbol search */
+  teachFind(threshold = .72) {
+    const u = this.level.underlays[this.underlay], b = this.teachBox, bmp = u && this.bitmaps[u.docId];
+    if (!bmp || !b) return [];
+    const px = v => (v) * u.pxPerM;
+    const hits = findSimilar(bmp, { x0: px(b.x0 - u.ox), y0: px(b.y0 - u.oy), x1: px(b.x1 - u.ox), y1: px(b.y1 - u.oy) }, { threshold });
+    this.teachHits = hits.map(h => ({ x: u.ox + h.px / u.pxPerM, y: u.oy + h.py / u.pxPerM, score: h.score }));
+    this.draw(); return this.teachHits;
+  }
+  placeTeachHits(symbolId) {
+    const def = getSymbol(symbolId), l = this.level; if (!def || !this.teachHits) return 0;
+    this.pushUndo(); let n = 0;
+    for (const h of this.teachHits) {
+      if (l.symbols.some(s => s.type === symbolId && Math.hypot(s.x - h.x, s.y - h.y) < .2)) continue;
+      const sn = def.mount === 'wall' ? this.wallSnapForSymbol(h.x, h.y) : null;
+      l.symbols.push({ id: uid('s'), type: symbolId, x: sn ? sn.x : h.x, y: sn ? sn.y : h.y, angle: sn ? sn.angle : 0 }); n++;
+    }
+    this.teachHits = null; this.teachBox = null; this.changed(); this.draw(); return n;
+  }
+  clearTeach() { this.teachHits = null; this.teachBox = null; this.draw(); }
+  /* OCR results → scale + room labels */
+  applyOcr(res, { scale = true, labels = [] } = {}) {
+    const u = this.level.underlays[this.underlay]; if (!u) return;
+    this.pushUndo();
+    if (scale && res.scale) {
+      // scale about the underlay's top-left corner so that world positions of the plan stay anchored
+      u.pxPerM = res.scale.pxPerM; u.calibrated = true; u.ocrScale = true;
+    }
+    for (const t of labels) this.level.rooms.push({ id: uid('r'), text: t.text, x: u.ox + t.x / u.pxPerM, y: u.oy + t.y / u.pxPerM });
+    this.changed(); this.draw();
+  }
+  setOcrOverlay(res) { const u = this.level.underlays[this.underlay]; this.ocrOverlay = res ? res.dims.map(d => ({ x: u.ox + (d.box.x0 + d.box.x1) / 2 / u.pxPerM, y: u.oy + (d.box.y0 + d.box.y1) / 2 / u.pxPerM, text: d.text, used: !!d.L })) : null; this.draw(); }
   autoAlign() {
     const lv = [...this.project.levels].sort((a, b) => a.order - b.order), i = lv.indexOf(this.level);
     const ref = [...lv.slice(0, i).reverse(), ...lv.slice(i + 1)].find(l => l.walls.length);
@@ -308,9 +360,15 @@ export class Editor {
       if (i > 0) { ctx.globalAlpha = .35; this.drawWalls(ctx, lv[i - 1], '#6b8bd6', true); ctx.globalAlpha = 1; }
     }
     this.drawWalls(ctx, l, bmp && this.underlayOpacity > .35 ? '#2563eb' : '#cbd5e1');
+    for (const c of l.columns) { const sel = this.sel && this.sel.id === c.id; ctx.fillStyle = sel ? '#f59e0b' : '#94a3b8'; ctx.strokeStyle = '#0b1220'; ctx.lineWidth = .02; if (c.round) { ctx.beginPath(); ctx.arc(c.x, c.y, c.w / 2, 0, 7); ctx.fill(); ctx.stroke(); } else { ctx.fillRect(c.x - c.w / 2, c.y - (c.d || c.w) / 2, c.w, c.d || c.w); ctx.strokeRect(c.x - c.w / 2, c.y - (c.d || c.w) / 2, c.w, c.d || c.w); } }
     ctx.restore();
+    for (const r of l.rooms) { const [x, y] = this.w2s(r.x, r.y), sel = this.sel && this.sel.id === r.id; ctx.font = '600 13px sans-serif'; ctx.textAlign = 'center'; const w = ctx.measureText(r.text).width + 12; ctx.fillStyle = '#0b1220cc'; ctx.fillRect(x - w / 2, y - 10, w, 20); ctx.strokeStyle = sel ? '#f59e0b' : '#475569'; ctx.strokeRect(x - w / 2, y - 10, w, 20); ctx.fillStyle = '#e2e8f0'; ctx.textBaseline = 'middle'; ctx.fillText(r.text, x, y + 1); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; }
+    if (this.ocrOverlay) for (const o of this.ocrOverlay) { const [x, y] = this.w2s(o.x, o.y); ctx.strokeStyle = o.used ? '#34d399' : '#fbbf24'; ctx.lineWidth = 2; ctx.strokeRect(x - 16, y - 9, 32, 18); }
     this.drawSymbols(ctx);
     this.drawOverlay(ctx);
+    const tb = this.drag && this.drag.kind === 'teach' ? { x0: Math.min(this.drag.a[0], this.drag.b[0]), y0: Math.min(this.drag.a[1], this.drag.b[1]), x1: Math.max(this.drag.a[0], this.drag.b[0]), y1: Math.max(this.drag.a[1], this.drag.b[1]) } : this.teachBox;
+    if (tb) { const [a, b] = this.w2s(tb.x0, tb.y0), [c, d] = this.w2s(tb.x1, tb.y1); ctx.strokeStyle = '#22d3ee'; ctx.setLineDash([6, 4]); ctx.lineWidth = 2; ctx.strokeRect(a, b, c - a, d - b); ctx.setLineDash([]); }
+    if (this.teachHits) for (const h of this.teachHits) { const [x, y] = this.w2s(h.x, h.y); ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 13, 0, 7); ctx.stroke(); }
   }
   drawGrid(ctx) {
     const v = this.view; let step = 1; while (step * v.s < 14) step *= 5; while (step * v.s > 90) step /= 5;
@@ -335,7 +393,7 @@ export class Editor {
           ctx.lineWidth = Math.max(.02, 1.5 / this.view.s); ctx.strokeStyle = osel ? '#f59e0b' : o.type === 'window' ? '#7dd3fc' : o.type === 'door' ? '#fbbf24' : '#94a3b8';
           if (o.type === 'window') { ctx.strokeRect(s, -w.t / 2, o.width, w.t); ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(s + o.width, 0); ctx.stroke(); }
           else if (o.type === 'door') { ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(s, -o.width); ctx.stroke(); ctx.beginPath(); ctx.arc(s, 0, o.width, -Math.PI / 2, 0); ctx.stroke(); }
-          else { ctx.setLineDash([.08, .06]); ctx.strokeRect(s, -w.t / 2, o.width, w.t); ctx.setLineDash([]); }
+          else { ctx.setLineDash([.08, .06]); ctx.strokeRect(s, -w.t / 2, o.width, w.t); ctx.setLineDash([]); if (['sectional', 'dock', 'rollup'].includes(o.type)) { ctx.strokeStyle = osel ? '#f59e0b' : '#fb923c'; ctx.beginPath(); ctx.moveTo(s, -w.t / 2); ctx.lineTo(s + o.width, w.t / 2); ctx.moveTo(s + o.width, -w.t / 2); ctx.lineTo(s, w.t / 2); ctx.stroke(); } }
           if (osel) { ctx.strokeStyle = '#f59e0b'; ctx.strokeRect(s, -w.t / 2 - .04, o.width, w.t + .08); }
         }
       }
@@ -351,6 +409,7 @@ export class Editor {
     const im = symbolImage(def, '#ffffff');
     if (im.complete && im.naturalWidth) ctx.drawImage(im, sx - r * .8, sy - r * .8, r * 1.6, r * 1.6);
     else im.onload = () => this.draw();
+    if (def.linear) { const L = (this.__len || def.len || 4) * this.view.s; ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + Math.cos(angle) * L, sy + Math.sin(angle) * L); ctx.stroke(); }
     if (def.mount === 'wall') { ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(sx - Math.cos(angle) * (r + 1), sy - Math.sin(angle) * (r + 1)); ctx.lineTo(sx + Math.cos(angle) * (r + 5), sy + Math.sin(angle) * (r + 5)); ctx.stroke(); }
     ctx.globalAlpha = 1;
   }
@@ -358,7 +417,7 @@ export class Editor {
     for (const s of this.level.symbols) {
       const def = getSymbol(s.type); if (!def) continue;
       const [x, y] = this.w2s(s.x, s.y);
-      this.drawSymbol(ctx, def, x, y, s.angle || 0, { sel: this.sel && this.sel.id === s.id });
+      this.__len = s.len; this.drawSymbol(ctx, def, x, y, s.angle || 0, { sel: this.sel && this.sel.id === s.id }); this.__len = null;
     }
   }
   drawOverlay(ctx) {
@@ -374,7 +433,7 @@ export class Editor {
         ctx.fillStyle = '#fff'; ctx.font = '12px sans-serif'; ctx.fillText(len.toFixed(2) + ' m', px + 10, py - 10);
       }
       ctx.strokeStyle = p[2] === 'end' ? '#34d399' : '#f59e0b'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, p[2] === 'end' ? 7 : 4, 0, 7); ctx.stroke();
-    } else if (['door', 'window', 'opening', 'garage'].includes(t)) {
+    } else if (['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup'].includes(t)) {
       const n = this.nearestWall(m.wx, m.wy, .5);
       if (n) {
         const d = OPENING_DEFAULTS[t], pos = clamp(n.t * n.L, d.width / 2, Math.max(d.width / 2, n.L - d.width / 2));

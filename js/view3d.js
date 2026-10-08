@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/OrbitControls.js';
-import { sortedLevels, elevations, wallExtensions, wallLen, footprintCells } from './model.js';
+import { sortedLevels, elevations, wallExtensions, wallLen, footprintCells, projectBBox } from './model.js';
 import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 
 const M = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: .85, metalness: 0, ...extra });
@@ -8,7 +8,7 @@ const M = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughne
 export class Viewer {
   constructor(container, { getImage } = {}) {
     this.el = container; this.getImage = getImage;
-    this.opts = { visible: null, explode: 0, xray: false, clip: 1, roof: true, devices: true, markers: true, planTex: false, hiddenCats: new Set() };
+    this.opts = { visible: null, explode: 0, xray: false, clip: 1, roof: true, devices: true, markers: true, rooms: true, planTex: false, hiddenCats: new Set() };
     const r = this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     r.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     r.shadowMap.enabled = true; r.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -30,7 +30,7 @@ export class Viewer {
     this.clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e4);
     this.mats = {
       wall: M(0xe8e2d6), floor: M(0x9aa3b2), roof: M(0x5b6578), glass: M(0x9fd4ff, { transparent: true, opacity: .35, roughness: .1 }),
-      frame: M(0xf4f4f4), door: M(0x8b5a2b), garage: M(0x7b8794),
+      frame: M(0xf4f4f4), door: M(0x8b5a2b), garage: M(0x7b8794), industrial: M(0x64748b, { roughness: .6, metalness: .3 }), dockdoor: M(0xe2e8f0, { roughness: .5 }), column: M(0xb8b4aa, { roughness: .9 }),
       plate: M(0xf5f5f5, { roughness: .5 }), dark: M(0x222831), metal: M(0x8e98a8, { metalness: .5, roughness: .4 }),
       board: M(0x4b5563), lamp: M(0xfff1b0, { emissive: 0xffd45a, emissiveIntensity: .9 }),
     };
@@ -69,13 +69,20 @@ export class Viewer {
     }
     this.mats.floor.opacity = xr ? .5 : 1; this.mats.floor.transparent = xr;
     let minY = 0, maxY = 3;
-    const topId = levels.length ? levels[levels.length - 1].id : null;
+    const bb = projectBBox(p), size = Math.max(bb.x1 - bb.x0, bb.y1 - bb.y0, 6);
+    this.size = size; this.k = Math.min(4, Math.max(1, size / 15)); this.center = [(bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2];
+    Object.assign(this.sun.shadow.camera, { left: -size * .8 - 8, right: size * .8 + 8, top: size * .8 + 8, bottom: -size * .8 - 8, far: size * 4 + 80 }); this.sun.shadow.camera.updateProjectionMatrix();
+    this.sun.position.set(this.center[0] + size * .5, size * .9 + 12, this.center[1] + size * .35); this.sun.target.position.set(this.center[0], 0, this.center[1]); this.scene.add(this.sun.target);
+    this.camera.far = size * 20 + 500; this.camera.updateProjectionMatrix(); this.controls.maxDistance = size * 8 + 100;
+    let topId = null, topY = -1e9; for (const l of levels) if (l.walls.length && elev[l.id] + l.height > topY) { topY = elev[l.id] + l.height; topId = l.id; }
     levels.forEach((lv, idx) => {
       if (!o.visible.has(lv.id)) return;
       const g = new THREE.Group(); g.position.y = idx * o.explode; g.userData.level = lv.id;
       const e = elev[lv.id];
       minY = Math.min(minY, e - lv.slab + g.position.y); maxY = Math.max(maxY, e + lv.height + g.position.y + (lv.id === topId && o.roof ? .3 : 0));
       this.buildWalls(g, lv, e);
+      this.buildColumns(g, lv, e);
+      if (o.rooms) this.buildRooms(g, lv, e);
       this.buildSlab(g, lv, e, lv.id === topId);
       if (o.devices) this.buildDevices(g, lv, e);
       if (o.planTex && this.getImage && lv.underlays.plan) this.addPlanTexture(g, lv, e, token);
@@ -86,12 +93,33 @@ export class Viewer {
     this.renderer.clippingPlanes = clipOn ? [this.clipPlane] : [];
     this.buildGround(minY);
   }
+  buildColumns(g, lv, e) {
+    for (const c of lv.columns || []) {
+      const H = c.h || lv.height;
+      const m = c.round ? new THREE.Mesh(new THREE.CylinderGeometry(c.w / 2, c.w / 2, H, 24), this.mats.column) : new THREE.Mesh(new THREE.BoxGeometry(c.w, H, c.d || c.w), this.mats.column);
+      m.position.set(c.x, e + H / 2, c.y); m.castShadow = m.receiveShadow = true; g.add(m);
+    }
+  }
+  buildRooms(g, lv, e) {
+    this._rt = this._rt || new Map();
+    for (const r of lv.rooms || []) {
+      let tex = this._rt.get(r.text);
+      if (!tex) {
+        const c = document.createElement('canvas'); c.width = 512; c.height = 128; const x = c.getContext('2d');
+        x.font = '600 56px Inter, Arial, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+        const w = Math.min(500, x.measureText(r.text).width + 40); x.fillStyle = 'rgba(11,18,32,.82)'; x.beginPath(); x.roundRect((512 - w) / 2, 24, w, 80, 18); x.fill();
+        x.fillStyle = '#fff'; x.fillText(r.text, 256, 66, 480); tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.userData = { w: (w + 0) / 512 }; this._rt.set(r.text, tex);
+      }
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+      const sc = .55 * this.k; sp.scale.set(sc * 4 * tex.userData.w + .001, sc, 1); sp.position.set(r.x, e + .4 * this.k, r.y); sp.renderOrder = 5; g.add(sp);
+    }
+  }
   buildGround(minY) {
     if (this.ground) { this.scene.remove(this.ground); this.ground.traverse(o => o.geometry && o.geometry.dispose()); }
-    const g = this.ground = new THREE.Group();
-    const pl = new THREE.Mesh(new THREE.CircleGeometry(60, 64), new THREE.MeshStandardMaterial({ color: 0x1c2a3f, roughness: 1 }));
-    pl.rotation.x = -Math.PI / 2; pl.position.y = minY - 0.02; pl.receiveShadow = true; g.add(pl);
-    const grid = new THREE.GridHelper(80, 80, 0x3b4c6b, 0x27344d); grid.position.y = minY - 0.015; g.add(grid);
+    const g = this.ground = new THREE.Group(), R = Math.max(60, this.size * 3), step = this.size > 45 ? 5 : 1;
+    const pl = new THREE.Mesh(new THREE.CircleGeometry(R, 64), new THREE.MeshStandardMaterial({ color: 0x1c2a3f, roughness: 1 }));
+    pl.rotation.x = -Math.PI / 2; pl.position.set(this.center[0], minY - 0.02, this.center[1]); pl.receiveShadow = true; g.add(pl);
+    const n = Math.round(R * 1.3 / step) * 2, grid = new THREE.GridHelper(n * step, n, 0x3b4c6b, 0x27344d); grid.position.set(this.center[0], minY - 0.015, this.center[1]); g.add(grid);
     this.scene.add(g);
   }
   box(parent, mat, w, h, d, x, y, z, ry = 0) {
@@ -115,7 +143,7 @@ export class Viewer {
       for (const op of ops) {
         const s = Math.max(0, op.pos - op.width / 2), en = Math.min(L, op.pos + op.width / 2);
         seg(cur, s, 0, H);
-        const sill = op.type === 'door' || op.type === 'opening' || op.type === 'garage' ? 0 : op.sill, head = Math.min(H, sill + op.height);
+        const sill = ['door', 'opening', 'garage', 'sectional', 'rollup'].includes(op.type) ? 0 : op.sill, head = Math.min(H, sill + op.height);
         seg(s, en, 0, sill); seg(s, en, head, H);
         const um = (s + en) / 2, cx = w.x1 + dx * um, cz = w.y1 + dy * um, ow = en - s;
         if (op.type === 'window') {
@@ -127,6 +155,10 @@ export class Viewer {
           this.box(g, mats.frame, ow - .08, .03, t * .9, cx, e + sill - .015, cz, ry);
         } else if (op.type === 'door' || op.type === 'garage') {
           this.box(g, op.type === 'door' ? mats.door : mats.garage, ow - .06, op.height - .03, .045, cx, e + (op.height - .03) / 2 + .01, cz, ry);
+        } else if (op.type === 'sectional' || op.type === 'rollup' || op.type === 'dock') {
+          const lm = op.type === 'dock' ? mats.dockdoor : mats.industrial, hh = op.height - .04, y0 = e + sill + .02;
+          const panels = Math.max(2, Math.round(hh / .6));
+          for (let i = 0; i < panels; i++) this.box(g, lm, ow - .08, hh / panels - .02, .06, cx, y0 + (i + .5) * hh / panels, cz, ry);
         }
         cur = en;
       }
@@ -136,12 +168,23 @@ export class Viewer {
   buildSlab(g, lv, e, isTop) {
     const fp = footprintCells(lv);
     if (!fp) return;
+    const st = this.project.settings || {}, gable = st.roofType === 'gable';
+    let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
     for (const r of fp.rects) {
       this.box(g, this.mats.floor, r.w, lv.slab, r.h, r.x + r.w / 2, e - lv.slab / 2, r.y + r.h / 2);
+      bx0 = Math.min(bx0, r.x); bx1 = Math.max(bx1, r.x + r.w); by0 = Math.min(by0, r.y); by1 = Math.max(by1, r.y + r.h);
       if (isTop && this.opts.roof) {
-        const rf = this.box(g, this.mats.roof, r.w + .6, .2, r.h + .6, r.x + r.w / 2, e + lv.height + .1, r.y + r.h / 2);
-        rf.receiveShadow = false;
+        if (gable) this.box(g, this.mats.roof, r.w, .15, r.h, r.x + r.w / 2, e + lv.height + .075, r.y + r.h / 2);
+        else { const rf = this.box(g, this.mats.roof, r.w + .6, .2, r.h + .6, r.x + r.w / 2, e + lv.height + .1, r.y + r.h / 2); rf.receiveShadow = false; }
       }
+    }
+    if (isTop && this.opts.roof && gable && bx1 > bx0) {
+      const ov = .5, W = bx1 - bx0 + 2 * ov, D = by1 - by0 + 2 * ov, alongX = W >= D, span = alongX ? D : W, len = alongX ? W : D;
+      const rise = Math.tan(THREE.MathUtils.degToRad(st.roofPitch || 8)) * span / 2;
+      const sh = new THREE.Shape(); sh.moveTo(-span / 2, 0); sh.lineTo(span / 2, 0); sh.lineTo(0, rise); sh.closePath();
+      const geo = new THREE.ExtrudeGeometry(sh, { depth: len, bevelEnabled: false }); geo.translate(0, 0, -len / 2);
+      const m = new THREE.Mesh(geo, this.mats.roof); m.rotation.y = alongX ? Math.PI / 2 : 0;
+      m.position.set((bx0 + bx1) / 2, e + lv.height + .15, (by0 + by1) / 2); m.castShadow = true; g.add(m);
     }
   }
   async addPlanTexture(g, lv, e, token) {
@@ -176,25 +219,26 @@ export class Viewer {
     for (const s of lv.symbols) {
       const def = getSymbol(s.type); if (!def || this.opts.hiddenCats.has(def.cat)) continue;
       const grp = new THREE.Group();
-      const dev = this.deviceMesh(def);
+      const dev = this.deviceMesh(def, s);
       grp.add(dev);
+      if (!def.linear && !['cabinet', 'trafo', 'motor'].includes(def.model)) dev.scale.setScalar(Math.min(2.2, 1 + (this.k - 1) * .35));
       const ang = s.angle || 0, mount = def.mount;
-      const y = mount === 'ceiling' ? e + lv.height - 0.01 : e + (s.z ?? def.h);
+      const y = mount === 'ceiling' ? (s.z != null ? e + s.z : e + lv.height - 0.01) : e + (s.z ?? def.h);
       grp.position.set(s.x, y, s.y);
-      grp.rotation.y = mount === 'wall' ? Math.atan2(Math.cos(ang), Math.sin(ang)) : -ang;
+      grp.rotation.y = mount === 'ceiling' ? -ang : Math.atan2(Math.cos(ang), Math.sin(ang));
       grp.userData = { sym: s, def, level: lv };
       g.add(grp); this.pickables.push(grp);
       if (this.opts.markers) {
         const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.markerTexture(def), transparent: true }));
-        sp.scale.set(.3, .3, 1);
-        const off = mount === 'ceiling' ? -.28 : mount === 'floor' ? .3 : .26;
+        sp.scale.set(.3 * this.k, .3 * this.k, 1);
+        const off = (mount === 'ceiling' ? -.28 : mount === 'floor' ? ((def.model === 'cabinet' || def.model === 'trafo') ? 2.4 : .6) : .26) * (mount === 'floor' ? 1 : this.k);
         sp.position.set(s.x + (mount === 'wall' ? Math.cos(ang) * .06 : 0), y + off, s.y + (mount === 'wall' ? Math.sin(ang) * .06 : 0));
         sp.userData = { sym: s, def, level: lv };
         g.add(sp); this.pickables.push(sp);
       }
     }
   }
-  deviceMesh(def) {
+  deviceMesh(def, s = {}) {
     const m = this.mats, g = new THREE.Group();
     const add = (geo, mat, x = 0, y = 0, z = 0, rx = 0, ry = 0) => { const k = new THREE.Mesh(geo, mat); k.position.set(x, y, z); k.rotation.set(rx, ry, 0); k.castShadow = true; g.add(k); return k; };
     const tint = def.tint ? M(def.tint, { roughness: .5 }) : m.plate;
@@ -232,6 +276,18 @@ export class Viewer {
       case 'fan': add(cyl(.11, .05), m.plate, 0, -.025, 0); add(cyl(.07, .052), m.dark, 0, -.026, 0); break;
       case 'board': add(box(.45, .65, .14), m.board, 0, 0, .07); add(box(.4, .58, .01), M(0x9ca3af), 0, 0, .145); break;
       case 'cyl': add(cyl(.2, .8), M(0xf3f4f6), 0, 0, .2); break;
+      case 'highbay': add(new THREE.ConeGeometry(.28, .3, 24, 1, true), M(0xc9d1dc, { side: THREE.DoubleSide, metalness: .5 }), 0, -.15, 0).rotation.x = Math.PI; add(cyl(.12, .05), m.lamp, 0, -.28, 0); break;
+      case 'tray': case 'busbar': { const L = s.len || def.len || 4; add(box(L, def.model === 'tray' ? .08 : .14, def.model === 'tray' ? .4 : .14), def.model === 'tray' ? m.metal : M(0xd97706), 0, -.05, 0); break; }
+      case 'cabinet': add(box(def.id === 'ind_ups' ? .6 : 1.2, 2.0, .6), M(0x9ca3af, { metalness: .3 }), 0, 1.0, .3); add(box(def.id === 'ind_ups' ? .4 : .9, .3, .02), M(0x2563eb, { emissive: 0x1d4ed8, emissiveIntensity: .5 }), 0, 1.5, .61); break;
+      case 'trafo': add(box(2.4, 2.2, 1.8), M(0x94a3b8, { metalness: .3 }), 0, 1.1, .9); add(box(1.8, .2, .02), M(0xfacc15), 0, 1.8, 1.81); break;
+      case 'motor': add(cyl(.22, .55), M(0x2563eb, { metalness: .4 }), 0, .35, 0, X, 0); add(box(.5, .08, .4), m.dark, 0, .04, 0); break;
+      case 'estop': add(cyl(.05, .04), M(0xf2c200), 0, 0, .02, X); add(cyl(.032, .04), M(0xd11a1a), 0, 0, .055, X); break;
+      case 'callpoint': add(box(.09, .09, .035), M(0xd11a1a), 0, 0, .0175); add(box(.05, .05, .01), M(0xffffff), 0, 0, .04); break;
+      case 'sprinkler': add(cyl(.012, .1, 8), M(0xb45309), 0, -.05, 0); add(cyl(.04, .01, 12), M(0xb45309), 0, -.11, 0); break;
+      case 'extinguisher': add(cyl(.07, .35), M(0xd11a1a), 0, 0, .1); add(cyl(.02, .06), m.dark, 0, .2, .1); break;
+      case 'hosereel': add(cyl(.2, .1), M(0xd11a1a), 0, 0, .06, X); add(cyl(.09, .11), m.dark, 0, 0, .06, X); break;
+      case 'sign': add(box(.4, .2, .025), M(0x16a34a, { emissive: 0x22c55e, emissiveIntensity: .7 }), 0, 0, .0125); break;
+      case 'camera': add(box(.08, .08, .22), M(0xe5e7eb), 0, 0, .11); add(cyl(.03, .04), m.dark, 0, 0, .23, X); break;
       default: add(box(.14, .14, .08), M(0x6b7280), 0, 0, .04); // generic / custom
     }
     return g;

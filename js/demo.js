@@ -88,3 +88,68 @@ export function demoProject() {
   for (const l of p.levels) for (const s of l.symbols) if (s.z == null) delete s.z;
   return p;
 }
+
+/* ---------------- industrial demo: warehouse + production hall + office block ---------------- */
+import { INDUSTRIAL_PRESETS as IP } from './model.js';
+export function demoIndustrial() {
+  const p = newProject('Demo industrial building');
+  p.settings.type = 'industrial'; p.settings.roofType = 'gable'; p.settings.roofPitch = 7;
+  const N = -D, S = D, Wd = Math.PI, E = 0;
+  /* ----- ground floor: 48 x 30 m ----- */
+  const g = newLevel(IP[1]);
+  const [gt, gr, gb, gl] = box(g, .3, 0, 0, 48, 30);
+  const fw = wall(34, .15, 34, 29.85, .3), ow = wall(.15, 18, 14, 18, .2), ov = wall(14, 18, 14, 29.85, .2), op1 = wall(7, 18.2, 7, 29.85, .1);
+  ow.h = ov.h = op1.h = 3; g.walls.push(fw, ow, ov, op1);
+  for (let x = 5; x <= 43; x += 7) op(g, gt, x, 3, 'window', 5.2, 1.4);
+  for (const x of [17, 21, 25, 29]) op(g, gb, x, 2.5, 'dock', 1.2, 2.8);
+  op(g, gb, 41, 4, 'sectional', 0, 4.2); op(g, gb, 3.5, 1.4, 'door', 0, 2.2); op(g, gb, 10.5, 2.4, 'window', .9, 1.6); op(g, gb, 3.5, 2.4, 'window', 4.2, 1.6); op(g, gb, 10.5, 2.4, 'window', 4.2, 1.6);
+  op(g, gl, 22, 1.6, 'window', .9, 1.4); op(g, gl, 26, 1.6, 'window', .9, 1.4);
+  op(g, gr, 15, 4.5, 'sectional', 0, 4.5); op(g, gr, 26, 1.0, 'door', 0, 2.2);
+  op(g, fw, 12, 3.2, 'opening', 0, 4); op(g, fw, 22, 1.2, 'door', 0, 2.1);
+  op(g, ow, 5.5, 1.0, 'door', 0, 2.1); op(g, ov, 7, 1.0, 'door', 0, 2.1); op(g, op1, 3, 1.0, 'door', 0, 2.1);
+  for (const x of [20, 27]) for (const y of [6, 12, 24]) g.columns.push({ id: uid('c'), x, y, w: .5, d: .5 });
+  for (const y of [8, 22]) g.columns.push({ id: uid('c'), x: 41, y, w: .6, d: .6, round: true });
+  g.rooms.push({ id: uid('r'), text: 'Magazijn', x: 24, y: 9 }, { id: uid('r'), text: 'Productie', x: 41, y: 15 }, { id: uid('r'), text: 'Kantoren', x: 7, y: 24 }, { id: uid('r'), text: 'Laadperrons', x: 24, y: 27 });
+  // electrical – lighting
+  for (const x of [6, 13, 20, 27]) for (const y of [4, 10, 15]) sym(g, 'ind_highbay', x, y, 0, { circuit: 'L1' });
+  for (const x of [20, 27, 31]) sym(g, 'ind_highbay', x, 24, 0, { circuit: 'L2' });
+  for (const x of [38, 44]) for (const y of [5, 12, 19, 26]) sym(g, 'ind_highbay', x, y, 0, { circuit: 'L3' });
+  for (const x of [24, 28]) sym(g, 'ind_dock_light', x, 29.85, -D, { z: 3.4, circuit: 'L2' });
+  sym(g, 'light_ceiling', 3.5, 22, 0, { label: 'Kantoor 1' }); sym(g, 'light_ceiling', 10.5, 22, 0, { label: 'Kantoor 2' }); sym(g, 'light_ceiling', 10.5, 26.5, 0); sym(g, 'light_ceiling', 3.5, 27, 0);
+  // power distribution
+  sym(g, 'ind_main_board', 31.5, 28.8, -D, { label: 'TGBT', circuit: 'HS' }); sym(g, 'ind_trafo', 45.4, 28.4, Wd, { label: 'Trafo 630 kVA' }); sym(g, 'ind_ups', 33, 25.5, 0 + Math.PI, { label: 'UPS' });
+  sym(g, 'ind_tray', 2, 8, 0, { z: 6.2, len: 31 }); sym(g, 'ind_tray', 36, 3, D, { z: 6.4, len: 24 });
+  sym(g, 'ind_busbar', 35.5, 14, 0, { z: 6.5, len: 12 }); sym(g, 'ind_crane', 3, 3, 0, { z: 7, len: 28 });
+  for (const y of [5, 10, 15, 22]) sym(g, 'ind_cee32', 33.85, y, Wd, { z: 1.2, circuit: 'K' + y });
+  sym(g, 'ind_cee63', 34.15, 20, E, { z: 1.2, circuit: 'K63' }); for (const y of [4, 14, 22]) sym(g, 'ind_cee16', 47.85, y, Wd, { z: 1.1 });
+  for (const y of [5, 9]) sym(g, 'ind_motor', 44, y, E, { label: 'Pomp ' + (y > 6 ? 2 : 1) });
+  sym(g, 'ind_motor', 40, 24, E, { label: 'Compressor' });
+  sym(g, 'ind_vfd', 47.85, 7, Wd, { z: 1.5 }); sym(g, 'ind_estop', 47.85, 11, Wd, { z: 1.3 }); sym(g, 'ind_estop', 34.15, 12, E, { z: 1.3 }); sym(g, 'ind_sub_board', 47.85, 18, Wd, { z: 1.4, label: 'OVB Productie' });
+  sym(g, 'ind_ev_dc', 20, 33, -D, { label: 'Snellader' });
+  sym(g, 'ind_generator', 46, 1.6, S, { label: 'Noodgenerator' });
+  for (const x of [8, 12]) sym(g, 'sock_double', x, 18.2 + .1, S, { z: .3 }); sym(g, 'data_rj45', 2.2, 24, E, { z: .3 }); sym(g, 'sw_single', 5.3, 18.3, S, {});
+  // fire & security
+  for (const [x, y] of [[8, 6], [20, 18], [28, 6], [38, 15], [44, 24]]) sym(g, 'fire_sprinkler', x, y, 0, {});
+  for (const [x, y] of [[10, 9], [24, 14], [41, 4], [24, 22]]) sym(g, 'fire_heat', x, y, 0);
+  sym(g, 'fire_callpoint', 33.85, 22.9, Wd, { z: 1.4 }); sym(g, 'fire_callpoint', 14.15, 22, E, { z: 1.4 }); sym(g, 'fire_callpoint', 47.85, 25, Wd, { z: 1.4 });
+  sym(g, 'fire_panel', 5.1, 18.3, S, { z: 1.5, label: 'Brandcentrale' }); sym(g, 'fire_horn', 33.85, 18, Wd, { z: 2.8 }); sym(g, 'fire_horn', 47.85, 14, Wd, { z: 2.8 });
+  for (const [x, y, a] of [[.15, 14, E], [34.15, 6, E], [47.85, 20, Wd], [33.85, 8, Wd]]) sym(g, 'fire_extinguisher', x, y, a, {});
+  sym(g, 'fire_hose', 20, 17.85 + 0, -D, {}); sym(g, 'fire_hose', 47.85, 22, Wd, {});
+  for (const [x, y, a] of [[3.5, 29.85, -D], [47.85, 26, Wd], [34.15, 22, E]]) sym(g, 'fire_exit', x, y, a, { z: 2.6 });
+  for (const [x, y, a] of [[-.15, -.15, -D], [48.15, 30.15, D], [48.15, -.15, -D], [-.15, 30.15, D]]) sym(g, 'sec_camera', x, y, a, { z: 4.5 });
+  sym(g, 'sec_reader', 1.9, 29.85, -D, {});
+  /* ----- mezzanine / offices over the office block ----- */
+  const f = newLevel(IP[2], { elev: 3.3 });
+  const [ft, fr, fb, fl] = box(f, .3, 0, 18, 14, 30);
+  const fm = wall(7, 18.15, 7, 29.85, .1); f.walls.push(fm);
+  op(f, fb, 3.5, 2.4, 'window', .9, 1.6); op(f, fb, 10.5, 2.4, 'window', .9, 1.6); op(f, fl, 24, 2.4, 'window', .9, 1.6); op(f, fm, 4, 1.0, 'door', 0, 2.1);
+  f.rooms.push({ id: uid('r'), text: 'Directie', x: 3.5, y: 24 }, { id: uid('r'), text: 'Vergaderzaal', x: 10.5, y: 24 });
+  for (const [x, y] of [[3.5, 24], [10.5, 24]]) sym(f, 'light_ceiling', x, y, 0, { circuit: 'K1' });
+  for (const [x, y] of [[3.5, 21], [10.5, 21], [3.5, 27], [10.5, 27]]) sym(f, 'light_tl', x, y, 0);
+  for (const y of [20, 27]) sym(f, 'sock_double', .15 + .15, y, E, { circuit: 'K2' });
+  sym(f, 'data_rj45', 13.7, 24, Wd, { z: .3 }); sym(f, 'ind_sub_board', 7.1, 19.5, E, { label: 'OVB Kantoren' }); sym(f, 'fire_exit', 6.9, 22, Wd, { z: 2.4 }); sym(f, 'fire_panel', 7.1, 28.5, E, {});
+  sym(f, 'safe_smoke', 3.5, 27, 0); sym(f, 'safe_smoke', 10.5, 27, 0);
+  p.levels.push(g, f);
+  for (const l of p.levels) for (const s of l.symbols) if (s.z == null) delete s.z;
+  return p;
+}

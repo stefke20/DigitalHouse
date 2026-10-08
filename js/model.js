@@ -9,15 +9,25 @@ export const LEVEL_PRESETS = [
   { kind: 'custom', name: 'Other level', order: 4, height: 2.6 },
 ];
 
+export const INDUSTRIAL_PRESETS = [
+  { kind: 'basement', name: 'Basement / technical level', order: -1, height: 3.5 },
+  { kind: 'ground', name: 'Hall / ground floor', order: 0, height: 8, slab: .3 },
+  { kind: 'first', name: 'Mezzanine / offices', order: 1, height: 3.2, slab: .3 },
+  { kind: 'second', name: 'Second floor', order: 2, height: 3.2, slab: .3 },
+  { kind: 'attic', name: 'Technical roof level', order: 3, height: 3, slab: .3 },
+  { kind: 'custom', name: 'Other level', order: 4, height: 4, slab: .3 },
+];
+export const presetsFor = type => type === 'industrial' ? INDUSTRIAL_PRESETS : LEVEL_PRESETS;
+
 export function newLevel(preset = LEVEL_PRESETS[1], extra = {}) {
   return {
-    id: uid('lv'), kind: preset.kind, name: preset.name, order: preset.order, height: preset.height, slab: 0.25,
+    id: uid('lv'), kind: preset.kind, name: preset.name, order: preset.order, height: preset.height, slab: preset.slab || 0.25,
     underlays: {}, // plan / elec : {docId,w,h,pxPerM,ox,oy,calibrated,paperPxPerMm}
-    walls: [], openings: [], symbols: [], ...extra,
+    walls: [], openings: [], symbols: [], columns: [], rooms: [], ...extra,
   };
 }
 export function newProject(name) {
-  return { id: uid('pr'), name: name || 'My house', created: Date.now(), updated: Date.now(), levels: [], settings: { roof: true }, thumb: null };
+  return { id: uid('pr'), name: name || 'My house', created: Date.now(), updated: Date.now(), levels: [], settings: { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8 }, thumb: null };
 }
 export const sortedLevels = p => [...p.levels].sort((a, b) => a.order - b.order);
 
@@ -31,6 +41,7 @@ export function elevations(p) {
   out[lv[gi].id] = 0;
   for (let i = gi + 1; i < lv.length; i++) out[lv[i].id] = out[lv[i - 1].id] + lv[i - 1].height + lv[i].slab;
   for (let i = gi - 1; i >= 0; i--) out[lv[i].id] = out[lv[i + 1].id] - lv[i + 1].slab - lv[i].height;
+  for (const l of lv) if (typeof l.elev === 'number') out[l.id] = l.elev; // manual override (e.g. a mezzanine inside a tall hall)
   return out;
 }
 
@@ -62,6 +73,7 @@ export function wallExtensions(level) {
 // Which grid cells of a level are "inside the house"? (flood fill from outside, walls dilated to seal gaps)
 export function footprintCells(level, cell = 0.1) {
   if (!level.walls.length) return null;
+  { let a0 = 1e9, a1 = -1e9, b0 = 1e9, b1 = -1e9; for (const w of level.walls) { a0 = Math.min(a0, w.x1, w.x2); a1 = Math.max(a1, w.x1, w.x2); b0 = Math.min(b0, w.y1, w.y2); b1 = Math.max(b1, w.y1, w.y2); } cell = Math.max(cell, Math.ceil(Math.sqrt((a1 - a0 + 2) * (b1 - b0 + 2) / 1.2e6) * 20) / 20); }
   const ext = wallExtensions(level);
   let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
   for (const w of level.walls) {
@@ -72,7 +84,7 @@ export function footprintCells(level, cell = 0.1) {
   const W = Math.ceil((x1 - x0) / cell), H = Math.ceil((y1 - y0) / cell);
   if (W * H > 4e6) return null;
   const wall = new Uint8Array(W * H);
-  const dil = 0.06;
+  const dil = Math.max(0.06, cell * .6);
   for (const w of level.walls) {
     const [e1, e2] = ext.get(w.id), L = wallLen(w);
     if (L < 1e-6) continue;
@@ -129,4 +141,10 @@ export function projectBBox(p) {
     y0 = Math.min(y0, w.y1, w.y2); y1 = Math.max(y1, w.y1, w.y2);
   }
   return x0 > x1 ? { x0: 0, y0: 0, x1: 10, y1: 8 } : { x0, y0, x1, y1 };
+}
+
+export function normalizeProject(p) {
+  p.settings = { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8, ...(p.settings || {}) };
+  for (const l of p.levels) { l.columns ||= []; l.rooms ||= []; }
+  return p;
 }

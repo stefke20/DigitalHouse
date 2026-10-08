@@ -38,9 +38,46 @@ dedicated circuit, power, floor, EV), data/TV/phone, bells, thermostat, smoke/CO
 appliances. Users can add their own icons. The pictograms are simplified redraws – compare against your own legend.
 The Symbol Library page also summarises how other countries differ.
 
+## OCR – reading dimensions and room names
+
+**🔎 Read dimensions & room names (OCR)** (Floor plans / Electrical tab) runs Tesseract (WebAssembly, vendored in
+`vendor/tesseract/`, Dutch + French + English models) in your browser – nothing is uploaded.
+
+* **Scale:** every recognised number is matched to the dimension line it sits on (the segment between the tick marks),
+  and the pixel length / stated value votes for a scale. Metres, centimetres and millimetres are tried and the
+  hypothesis supported by most labels wins. Vertical dimension text is read too (3 passes). Result and confidence are
+  shown before anything is applied; matched numbers are boxed on the drawing so you can verify.
+  On the synthetic test plan 4 of 4 labels agreed and the scale came out exact.
+* **Room / zone names:** words such as *Keuken*, *Magazijn*, *Loods* become draggable labels (also shown in 3D).
+
+## Teach-by-example symbol finder (🔍, Electrical tab)
+
+Drag a box around **one** symbol on your situatieschema, pick what it is, and HouseVault finds every look-alike on the
+drawing (normalised cross-correlation) and places them – wall devices snap to the nearest wall face. Because the
+template comes from *your* drawing, it works for any symbol style, including industrial and custom ones.
+Matching assumes the same size and orientation as the example (box a rotated one separately).
+
+## Industrial / commercial properties
+
+Choose **Industrial / commercial building** when creating a project:
+
+* level presets for halls, mezzanines, offices, technical levels (tall walls, thick slabs); floor elevation can be set
+  manually, e.g. a mezzanine inside a hall;
+* structural **columns** (square or round), overhead **sectional doors**, **loading-dock doors**, roller shutters,
+  large openings, **gable roof** with adjustable pitch, room / zone labels;
+* wall detection tuned for thick walls and large gaps (sectional / dock doors are suggested for wide outer gaps);
+* 27 extra symbols: high-bay luminaires, cable trays and busbar trunking (with length), main (TGBT) / sub boards,
+  CEE sockets 16/32/63 A, motors, VFDs, emergency stops, transformer cabin, generator, UPS, crane feed, DC fast
+  charger – plus fire & security: manual call points, heat detectors, alarm panel, horns, sprinklers, extinguishers,
+  hose reels, exit signs, CCTV, badge readers;
+* an **industrial demo** (48 × 30 m hall with production area, dock doors and office mezzanine) on the home page.
+
 ## Limits (honest notes)
 
-* Wall detection is a heuristic for clean, axis-aligned plans. Scanned/rotated/hatched drawings need manual correction.
-* Dimensions written on the plan are not read (no OCR) – you calibrate with one known length.
-* Electrical symbols are placed manually; they are not recognised automatically on the uploaded situatieschema.
+* Wall detection is a heuristic for clean, axis-aligned plans. Scanned, rotated or hatched drawings need correction.
+* OCR needs reasonably clean, high-resolution drawings. Handwriting and very small or stylised fonts are missed, and
+  dimension chains that lack tick marks may not be matched. Always glance at the OCR result before applying it.
+* Symbols are not recognised from the built-in icon library (it is a redraw, not your installer's exact glyphs);
+  use the teach-by-example finder or place them by hand.
+* Levels share one coordinate system and a vertical stack; non-rectangular roofs are approximated by a bounding gable.
 * The eendraadschema is stored in the library but not interpreted.

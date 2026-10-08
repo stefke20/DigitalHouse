@@ -1,9 +1,9 @@
 import { h, toast, modal, uid, debounce, fmtBytes, download } from './util.js';
 import * as db from './db.js';
-import { LEVEL_PRESETS, newLevel, newProject, sortedLevels, wallLen } from './model.js';
+import { LEVEL_PRESETS, presetsFor, newLevel, newProject, sortedLevels, wallLen, normalizeProject } from './model.js';
 import { SYMBOLS, CATEGORIES, allSymbols, getSymbol, svgMarkup, loadCustomSymbols, saveCustomSymbol, removeCustomSymbol } from './symbols.js';
 import { rasterize, isPdf, pdfPageCount } from './files.js';
-import { demoProject } from './demo.js';
+import { demoProject, demoIndustrial } from './demo.js';
 
 const view = document.getElementById('view');
 let cleanup = null, pendingFiles = [];
@@ -16,7 +16,7 @@ const getImage = docId => {
   return imgCache.get(docId);
 };
 const saveNow = p => { p.updated = Date.now(); return db.put('projects', JSON.parse(JSON.stringify(p))); };
-const loadProject = id => db.get('projects', id);
+const loadProject = async id => { const p = await db.get('projects', id); return p && normalizeProject(p); };
 const countSyms = p => p.levels.reduce((n, l) => n + l.symbols.length, 0);
 async function storeDoc({ projectId, levelId = null, category, file, blob, role = 'original', name }) {
   const b = blob || file;
@@ -27,7 +27,8 @@ async function addUnderlay(project, level, kind, file, page = 1) {
   const r = await rasterize(file, page);
   const orig = await storeDoc({ projectId: project.id, levelId: level.id, category: kind === 'plan' ? 'floorplan' : 'situatieschema', file });
   const ul = await storeDoc({ projectId: project.id, levelId: level.id, category: kind === 'plan' ? 'floorplan' : 'situatieschema', blob: r.blob, role: 'underlay', name: file.name + '.png' });
-  const pxPerM = r.paperPxPerMm ? r.paperPxPerMm * 10 : Math.max(r.w, r.h) / 14; // guess: 1:100 / ~14 m long
+  const ind = project.settings && project.settings.type === 'industrial';
+  const pxPerM = r.paperPxPerMm ? r.paperPxPerMm * (ind ? 5 : 10) : Math.max(r.w, r.h) / (ind ? 70 : 14); // rough guess (1:200 / 1:100) – refined by OCR or calibration
   const prev = level.underlays.plan;
   level.underlays[kind] = { docId: ul.id, origId: orig.id, w: r.w, h: r.h, pxPerM, ox: prev && kind === 'elec' ? prev.ox : 0, oy: prev && kind === 'elec' ? prev.oy : 0, calibrated: false, paperPxPerMm: r.paperPxPerMm };
 }
@@ -69,7 +70,7 @@ function pageHome() {
       h('h1', {}, 'Your house, ', h('em', {}, 'documented'), ' and seen in 3D'),
       h('p', {}, 'A digital library for plans, situatieschema’s and eendraadschema’s. Turn floor plans of every level into one scaled 3D model – with every lamp, switch and socket in its place.'),
       cta,
-      h('p', { style: { marginTop: '18px', fontSize: '14px' } }, 'No plan at hand? ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(); } }, 'Open the demo house'), ' · ', h('a', { href: '#/projects' }, 'My Projects'))),
+      h('p', { style: { marginTop: '18px', fontSize: '14px' } }, 'No plan at hand? ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(); } }, 'Open the demo house'), ' · ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(true); } }, 'Open the industrial demo'), ' · ', h('a', { href: '#/projects' }, 'My Projects'))),
     h('div', { class: 'wrap', style: { paddingTop: 0 } },
       h('div', { class: 'steps' },
         step(1, 'Upload every level', 'Basement, ground floor, first floor… Each level is usually its own document – HouseVault stacks them into one building.'),
@@ -77,8 +78,8 @@ function pageHome() {
         step(3, 'Add the electrical plan', 'Upload the situatieschema and place symbols from the Belgian (AREI) icon library – each type keeps its own identity in 3D.'),
         step(4, 'Explore', 'Orbit, zoom, peel the building layer by layer, cut sections, explode the floors.')))));
 }
-async function loadDemo() {
-  const p = demoProject();
+async function loadDemo(industrial = false) {
+  const p = industrial ? demoIndustrial() : demoProject();
   await saveNow(p);
   await new Promise(r => setTimeout(r, 50));
   location.hash = `#/project/${p.id}/3d`;
@@ -86,7 +87,7 @@ async function loadDemo() {
 
 /* ---------------- wizard ---------------- */
 function pageWizard() {
-  const rows = [];
+  const rows = []; let ptype = 'residential';
   const nameIn = h('input', { value: 'My house', style: { width: '280px' } });
   const list = h('div'), extraList = h('div'), status = h('div', { class: 'muted' }), bar = h('div', { class: 'progress', style: { display: 'none' } }, h('div'));
   function addRow(preset) {
@@ -101,7 +102,7 @@ function pageWizard() {
       if (r.file && isPdf(r.file)) { try { r.pages = await pdfPageCount(r.file); pageI.max = r.pages; pageBox.style.display = 'flex'; pageBox.style.flexDirection = 'column'; } catch { } } else pageBox.style.display = 'none';
     } });
     const eIn = h('input', { type: 'file', accept: '.pdf,image/*', style: { display: 'none' }, onchange: () => { r.elec = eIn.files[0]; elecInfo.textContent = r.elec ? r.elec.name : 'optional'; } });
-    r.getName = () => nameI.value || preset.name;
+    r.getName = () => nameI.value || r.preset.name; r.setName = v => nameI.value = v;
     r.setFile = f => { const dt = new DataTransfer(); dt.items.add(f); fIn.files = dt.files; fIn.onchange(); };
     r.el = h('div', { class: 'levelrow' },
       h('div', { class: 'form-row' },
@@ -119,7 +120,10 @@ function pageWizard() {
     x.el = h('div', { class: 'form-row' }, h('div', {}, '📎 ' + file.name), h('div', {}, cat), h('button', { class: 'small danger', onclick: () => { extras.splice(extras.indexOf(x), 1); x.el.remove(); } }, '✕'));
     extraList.append(x.el);
   }
-  const addSel = h('select', {}, LEVEL_PRESETS.map((p, i) => h('option', { value: i }, p.name)));
+  const addSel = h('select', {});
+  const fillAdd = () => { addSel.innerHTML = ''; presetsFor(ptype).forEach((p, i) => addSel.append(h('option', { value: i }, p.name))); };
+  fillAdd();
+  const typeSel = h('select', { onchange: () => { const old = presetsFor(ptype); ptype = typeSel.value; const nw = presetsFor(ptype); rows.forEach(r => { const np = nw.find(p => p.kind === r.preset.kind) || nw[1]; if (r.getName() === r.preset.name) r.setName(np.name); r.preset = np; }); fillAdd(); } }, h('option', { value: 'residential' }, 'House / apartment'), h('option', { value: 'industrial' }, 'Industrial / commercial building'));
   const extraIn = h('input', { type: 'file', multiple: true, style: { display: 'none' }, onchange: () => [...extraIn.files].forEach(addExtra) });
   const go = h('button', { class: 'primary', onclick: submit }, 'Upload & start visualizing →');
 
@@ -134,6 +138,7 @@ function pageWizard() {
     go.disabled = true; bar.style.display = 'block';
     try {
       const p = newProject(nameIn.value.trim() || 'My house');
+      p.settings.type = ptype; if (ptype === 'industrial') { p.settings.roofType = 'gable'; p.settings.roofPitch = 7; }
       let step = 0; const total = ready.length * 2 + extras.length + 1;
       const tick = t => { status.textContent = t; bar.firstChild.style.width = (++step / total * 100) + '%'; };
       for (const r of ready) {
@@ -150,9 +155,9 @@ function pageWizard() {
   view.append(h('div', { class: 'wrap', style: { maxWidth: '900px' } },
     h('h1', {}, 'New project'),
     h('p', { class: 'muted' }, 'Upload one plan per level. Order does not matter – levels are stacked according to their type. You can add more levels or documents later.'),
-    h('div', { class: 'form-row' }, h('div', {}, h('label', {}, 'Project name'), nameIn)),
+    h('div', { class: 'form-row' }, h('div', {}, h('label', {}, 'Project name'), nameIn), h('div', {}, h('label', {}, 'Property type'), typeSel)),
     list,
-    h('div', { class: 'form-row' }, addSel, h('button', { onclick: () => addRow(LEVEL_PRESETS[+addSel.value]) }, '+ Add level')),
+    h('div', { class: 'form-row' }, addSel, h('button', { onclick: () => addRow(presetsFor(ptype)[+addSel.value]) }, '+ Add level')),
     h('h3', { style: { marginTop: '26px' } }, 'Other documents (optional)'),
     h('p', { class: 'muted' }, 'Eendraadschema, keuringsverslag, EPC… stored in your library next to the plans.'),
     extraList, h('button', { onclick: () => extraIn.click() }, '+ Add documents', extraIn),
@@ -164,7 +169,7 @@ async function pageProjects() {
   const projects = (await db.getAll('projects')).sort((a, b) => b.updated - a.updated);
   const wrap = h('div', { class: 'wrap' });
   wrap.append(h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '18px' } }, h('h1', { style: { margin: 0, flex: 1 } }, 'My Projects'),
-    h('button', { onclick: loadDemo }, 'Open demo house'), h('a', { class: 'btn primary', href: '#/new' }, '+ New project')));
+    h('button', { onclick: () => loadDemo() }, 'Demo house'), h('button', { onclick: () => loadDemo(true) }, 'Industrial demo'), h('a', { class: 'btn primary', href: '#/new' }, '+ New project')));
   if (!projects.length) wrap.append(h('div', { class: 'empty' }, h('div', { style: { fontSize: '44px' } }, '🏠'), h('h3', {}, 'No projects yet'), 'Upload a floor plan to create your first 3D house.'));
   const grid = h('div', { class: 'grid' });
   for (const p of projects) {
@@ -246,7 +251,10 @@ function tab3d(project, body, save) {
     const ck = (label, key) => h('div', { class: 'row chk' }, h('label', { for: 'ck' + key }, label), h('input', { type: 'checkbox', id: 'ck' + key, checked: viewer.opts[key], onchange: e => { viewer.set({ [key]: e.target.checked }); if (key === 'roof') { project.settings.roof = e.target.checked; save(); } } }));
     side.append(h('div', {}, h('h4', {}, 'Explore'),
       sl('Explode floors', 'explode', 0, 4, .1, viewer.opts.explode), sl('Section cut', 'clip', 0.05, 1, .01, viewer.opts.clip),
-      ck('X-ray walls', 'xray'), ck('Roof', 'roof'), ck('Electrical devices', 'devices'), ck('Symbol markers', 'markers'), ck('Floor plan on floor', 'planTex')));
+      ck('X-ray walls', 'xray'), ck('Roof', 'roof'), ck('Room labels', 'rooms'), ck('Electrical devices', 'devices'), ck('Symbol markers', 'markers'), ck('Floor plan on floor', 'planTex')));
+    const st = project.settings;
+    side.append(h('div', {}, h('h4', {}, 'Roof'), h('div', { class: 'row' }, h('label', {}, 'Shape'), h('select', { onchange: e => { st.roofType = e.target.value; save(); viewer.build(); } }, [['flat', 'Flat'], ['gable', 'Gable (two-pitch)']].map(([v, t]) => h('option', { value: v, selected: st.roofType === v }, t)))),
+      h('div', { class: 'row' }, h('label', {}, 'Pitch ' + (st.roofPitch || 8) + '°'), h('input', { type: 'range', min: 3, max: 45, step: 1, value: st.roofPitch || 8, onchange: e => { st.roofPitch = +e.target.value; save(); viewer.build(); buildPanel(); } }))));
     // electrical legend, grouped by category
     const counts = {};
     for (const l of levels) if (vis.has(l.id)) for (const s of l.symbols) counts[s.type] = (counts[s.type] || 0) + 1;
@@ -286,7 +294,7 @@ function tabEditor(project, body, save, tab, q) {
     editor = window.__editor = new Editor(canvasHost, {
       project, getImage, onChange: () => { save(); renderSteps(); },
       onSelect: () => renderProps(), onStatus: t => status.textContent = t,
-      onTool: t => { if (t === 'calibrate-ready') { showCalib(); return; } calibBox.style.display = 'none'; Object.entries(toolBtns).forEach(([k, b]) => b.classList.toggle('active', k === t)); },
+      onTool: t => { if (t === 'calibrate-ready') { showCalib(); return; } if (t === 'teach-ready') { showTeach(); return; } calibBox.style.display = 'none'; teachCard.style.display = 'none'; Object.entries(toolBtns).forEach(([k, b]) => b.classList.toggle('active', k === t)); },
       onLevel: l => { currentLevel = l; renderLevels(); renderSteps(); renderLevelSettings(); renderProps(); },
     });
     canvasHost.append(status, h('div', { class: 'ed-zoom' }, h('button', { title: 'Zoom in', onclick: () => editor.zoomBy(1.3) }, '＋'), h('button', { title: 'Zoom out', onclick: () => editor.zoomBy(1 / 1.3) }, '－'), h('button', { title: 'Fit', onclick: () => editor.fit() }, '⤢')));
@@ -301,8 +309,8 @@ function tabEditor(project, body, save, tab, q) {
   }
   /* toolbar */
   const tools = mode === 'plan'
-    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['erase', '🗑', 'Erase (E)'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
-    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['erase', '🗑', 'Erase (E)']];
+    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['sectional', '▤', 'Overhead (sectional) door'], ['dock', '🚚', 'Loading-dock door'], ['column', '▣', 'Structural column'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
+    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['teach', '🔍', 'Find look-alike symbols: box ONE example on the drawing'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)']];
   for (const [k, ic, tip] of tools) { const b = h('button', { title: tip, onclick: () => editor && editor.setTool(k) }, ic); toolBtns[k] = b; left.append(b); }
   left.append(h('div', { class: 'sep' }), h('button', { title: 'Undo (Ctrl+Z)', onclick: () => editor && editor.undo() }, '↶'), h('button', { title: 'Redo (Ctrl+Y)', onclick: () => editor && editor.redo() }, '↷'));
 
@@ -322,10 +330,52 @@ function tabEditor(project, body, save, tab, q) {
   function syncUnderlayUI() { if (ulSel && editor) ulSel.value = editor.underlay; renderSteps(); }
 
   /* side panel pieces */
-  const stepsBox = h('div'), calibBox = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), lvBox = h('div'), propsBox = h('div', { class: 'props' }), actions = h('div');
+  const teachCard = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), stepsBox = h('div'), calibBox = h('div', { class: 'card', style: { display: 'none', padding: '10px' } }), lvBox = h('div'), propsBox = h('div', { class: 'props' }), actions = h('div');
   const paletteBox = h('div');
-  side.append(stepsBox, calibBox, actions, lvBox, propsBox);
+  side.append(stepsBox, calibBox, teachCard, actions, lvBox, propsBox);
   if (mode === 'elec') side.append(paletteBox);
+
+
+  function showTeach() {
+    teachCard.style.display = 'block'; teachCard.innerHTML = '';
+    const sel = h('select', { style: { width: '100%' } }, Object.entries(CATEGORIES).map(([c, i]) => h('optgroup', { label: i.nl }, allSymbols().filter(x => x.cat === c).map(x => h('option', { value: x.id, selected: x.id === selSym }, x.nl)))));
+    const thr = h('input', { type: 'range', min: .5, max: .95, step: .01, value: .72 }), info = h('div', { class: 'muted', style: { margin: '6px 0' } }, 'Choose which symbol this example is, then search the whole drawing for look-alikes.');
+    const place = h('button', { class: 'primary small', disabled: true, onclick: () => { const n = editor.placeTeachHits(sel.value); teachCard.style.display = 'none'; toast(`Placed ${n} ${getSymbol(sel.value).nl}`, 'ok'); renderSteps(); } }, 'Place symbols');
+    const find = h('button', { class: 'small', onclick: () => { info.textContent = 'Searching…'; setTimeout(() => { const hits = editor.teachFind(+thr.value); info.textContent = hits.length ? `${hits.length} look-alike${hits.length === 1 ? '' : 's'} found (circled). Adjust the threshold if some are missing or wrong.` : 'No matches – lower the threshold or box the symbol more tightly.'; place.disabled = !hits.length; place.textContent = `Place ${hits.length} symbols`; }, 30); } }, 'Find look-alikes');
+    teachCard.append(h('b', {}, '🔍 Teach by example'), h('div', { class: 'row', style: { marginTop: '8px' } }, sel), h('div', { class: 'row' }, h('label', { style: { flex: '0 0 auto' } }, 'Strictness'), thr), info, h('div', { class: 'row' }, find, place, h('button', { class: 'small', onclick: () => { editor.clearTeach(); teachCard.style.display = 'none'; } }, 'Cancel')));
+  }
+  function ocrModal() {
+    const u = currentLevel && currentLevel.underlays[editor.underlay];
+    if (!u) return toast('No underlay to read – upload a plan first.', 'err');
+    const lang = h('select', {}, [['nld+eng', 'Dutch + English'], ['fra+eng', 'French + English'], ['eng', 'English only']].map(([v, t]) => h('option', { value: v }, t)));
+    const qual = h('select', {}, h('option', { value: 'thorough' }, 'Thorough – also reads vertical text (3 passes)'), h('option', { value: 'quick' }, 'Quick – horizontal text only'));
+    const prog = h('div', { class: 'progress', style: { display: 'none', margin: '12px 0 4px' } }, h('div')), stt = h('div', { class: 'muted' });
+    const go = h('button', { class: 'primary', onclick: async () => {
+      go.disabled = true; prog.style.display = 'block'; stt.textContent = 'Loading OCR engine (first time takes a few seconds)…';
+      try {
+        const [{ readPlanText }, bmp] = await Promise.all([import('./ocr.js'), getImage(u.docId)]);
+        const res = await readPlanText(bmp, { langs: lang.value, thorough: qual.value === 'thorough', onProgress: p => { stt.textContent = p.stage; prog.firstChild.style.width = Math.round(p.pct * 100) + '%'; } });
+        m.close(); showOcrResult(res, u);
+      } catch (e) { console.error(e); stt.textContent = 'OCR failed: ' + e.message; go.disabled = false; }
+    } }, 'Start reading');
+    const m = modal(h('div', { style: { width: 'min(520px,90vw)' } }, h('h3', {}, '🔎 Read text from the drawing (OCR)'),
+      h('p', { class: 'muted' }, 'Reads dimension numbers (to derive the scale automatically) and room / zone names. Runs entirely in your browser – the drawing never leaves your computer.'),
+      h('div', { class: 'form-row' }, h('div', {}, h('label', {}, 'Language'), lang), h('div', {}, h('label', {}, 'Quality'), qual)), prog, stt, h('div', { style: { marginTop: '12px' } }, go)));
+  }
+  function showOcrResult(res, u) {
+    editor.setOcrOverlay(res);
+    const sc = res.scale, good = sc && sc.votes >= 2;
+    const useScale = h('input', { type: 'checkbox', checked: !!good });
+    const labelRows = res.labels.map(l => { const ck = h('input', { type: 'checkbox', checked: true }), tx = h('input', { value: l.text, style: { flex: 1 } }); return { l, ck, tx, el: h('div', { class: 'row' }, ck, tx) }; });
+    const dimsTxt = res.dims.length ? res.dims.map(d => d.text + (d.L ? ' ✓' : '')).join('  ·  ') : 'none';
+    const m = modal(h('div', { style: { width: 'min(560px,90vw)' } }, h('h3', {}, 'OCR result'),
+      h('p', { class: 'muted' }, `${res.words} text fragments read. Green boxes on the drawing = dimension labels that were matched to a dimension line, yellow = numbers that could not be matched.`),
+      h('div', { class: 'card', style: { marginBottom: '12px' } }, h('b', {}, 'Scale'), sc ? h('div', {}, `${sc.votes} of ${sc.total} usable dimension labels agree: ${sc.pxPerM.toFixed(1)} px per metre (labels read as ${sc.unit}). `, good ? '' : h('span', { style: { color: '#fbbf24' } }, 'Only one label supports this – please verify with the ruler tool.')) : h('div', { class: 'muted' }, 'No reliable scale found (no dimension numbers sitting on dimension lines). Use the ruler tool 📏 instead.'),
+        sc ? h('div', { class: 'row', style: { marginTop: '6px' } }, useScale, h('label', { style: { flex: 1, color: '#e6ecf7' } }, 'Apply this scale to the plan')) : null),
+      h('div', { class: 'card', style: { marginBottom: '12px' } }, h('b', {}, 'Numbers read'), h('div', { class: 'muted', style: { wordBreak: 'break-word' } }, dimsTxt)),
+      h('div', { class: 'card', style: { marginBottom: '12px', maxHeight: '220px', overflow: 'auto' } }, h('b', {}, `Room / zone labels (${labelRows.length})`), labelRows.length ? labelRows.map(r => r.el) : h('div', { class: 'muted' }, 'No labels recognised.')),
+      h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => { editor.applyOcr(res, { scale: useScale.checked && !!sc, labels: labelRows.filter(r => r.ck.checked).map(r => ({ ...r.l, text: r.tx.value })) }); editor.setOcrOverlay(null); m.close(); editor.fit(); renderSteps(); toast('Applied', 'ok'); } }, 'Apply'), h('button', { onclick: () => { editor.setOcrOverlay(null); m.close(); } }, 'Discard'))), { onClose: () => editor.setOcrOverlay(null) });
+  }
 
   function showCalib() {
     calibBox.style.display = 'block'; calibBox.innerHTML = '';
@@ -342,7 +392,7 @@ function tabEditor(project, body, save, tab, q) {
       const done = [!!l.underlays.plan, !!(l.underlays.plan && l.underlays.plan.calibrated), l.walls.length > 0, l.openings.length > 0, true];
       stepsBox.append(h('h4', {}, 'Interpret this level'), h('ol', { class: 'steplist' },
         ...['Upload the floor plan', 'Set the scale (one known distance)', 'Detect or draw the walls', 'Place doors & windows', 'Align levels on top of each other'].map((t, i) => h('li', { class: done[i] ? 'done' : '' }, t))));
-      if (q.get('setup') && !l.walls.length) stepsBox.append(h('div', { class: 'banner', style: { marginTop: '8px' } }, 'Start with step 2: pick the 📏 tool, click both ends of a wall or dimension whose length you know, then enter it.'));
+      if (q.get('setup') && !l.walls.length) stepsBox.append(h('div', { class: 'banner', style: { marginTop: '8px' } }, 'Start with step 2: run 🔎 OCR to read the dimension numbers and set the scale automatically – or pick the 📏 tool, click both ends of something whose length you know, and enter it.'));
       if (!l.underlays.plan) actions.append(h('button', { onclick: () => uploadUnderlayModal(l, 'plan') }, '📄 Upload floor plan'));
       else {
         if (editor.underlay === 'plan' && l.underlays.plan.paperPxPerMm) {
@@ -350,7 +400,7 @@ function tabEditor(project, body, save, tab, q) {
           actions.append(h('div', { class: 'row' }, h('label', { style: { flex: '0 0 auto' } }, 'PDF printed at 1:'), den, h('button', { class: 'small', onclick: () => { editor.setPaperScale(+den.value); editor.fit(); renderSteps(); } }, 'Apply')));
         }
         const tIn = h('input', { type: 'number', step: '0.01', min: '0.05', value: editor.defaultT || .2, style: { width: '70px' }, onchange: () => editor.defaultT = +tIn.value || .2 });
-        actions.append(
+        actions.append(h('button', { onclick: ocrModal }, '🔎 Read dimensions & room names (OCR)'),
           h('button', { class: 'primary', disabled: !l.underlays.plan.calibrated, title: l.underlays.plan.calibrated ? '' : 'Calibrate first', onclick: async e => { if (l.walls.length && !confirm('Replace the current walls and openings with a fresh detection?')) return; e.target.disabled = true; try { const r = await editor.detect(); toast(r.walls.length ? `Detected ${r.walls.length} walls and ${r.openings.length} openings – please review them.` : 'No walls found. Try a cleaner plan or draw the walls manually.', r.walls.length ? 'ok' : 'err'); editor.setUnderlay('plan'); } catch (er) { toast(er.message, 'err'); } renderSteps(); } }, '✨ Detect walls from plan'),
           h('div', { class: 'row' }, h('label', { style: { flex: '0 0 auto' } }, 'New wall thickness (m)'), tIn),
           h('button', { onclick: () => { if (editor.autoAlign()) { editor.fit(); toast('Aligned to another level’s top-left corner – fine-tune with ⇱', 'ok'); } else toast('Needs walls on this and another level', 'err'); } }, '⇱ Auto-align to other level'),
@@ -360,6 +410,7 @@ function tabEditor(project, body, save, tab, q) {
     } else {
       if (!l.underlays.elec) actions.append(h('div', { class: 'banner' }, 'No situatieschema for this level yet. You can still place symbols on the floor plan.'), h('button', { onclick: () => uploadUnderlayModal(l, 'elec') }, '⚡ Upload situatieschema'));
       else if (!l.underlays.elec.calibrated) actions.append(h('div', { class: 'banner' }, 'Calibrate the situatieschema (📏), or use the move tool (🖼) to line it up with the walls. If it is the same drawing as the floor plan, set the same scale.'));
+      if (l.underlays.elec) actions.append(h('button', { onclick: ocrModal }, '🔎 Read text (OCR)'));
       renderPalette();
     }
   }
@@ -385,6 +436,7 @@ function tabEditor(project, body, save, tab, q) {
     lvBox.innerHTML = ''; const l = currentLevel; if (!l || mode !== 'plan') return;
     const f = (label, key, step = .05, type = 'number') => h('div', { class: 'row' }, h('label', {}, label), h('input', { type, step, value: l[key], onchange: e => { l[key] = type === 'number' ? +e.target.value : e.target.value; if (key === 'order') { /* re-sort */ } editor.changed(); renderLevels(); } }));
     lvBox.append(...[h('h4', {}, 'Level settings'), f('Name', 'name', null, 'text'), f('Wall height (m)', 'height'), f('Floor thickness', 'slab'),
+      h('div', { class: 'row' }, h('label', {}, 'Floor elevation (m)'), h('input', { type: 'number', step: .1, placeholder: 'auto', value: typeof l.elev === 'number' ? l.elev : '', title: 'Leave empty to stack automatically. Set it for e.g. a mezzanine inside a tall hall.', onchange: e => { l.elev = e.target.value === '' ? undefined : +e.target.value; editor.changed(); } })),
       h('div', { class: 'row' }, h('label', {}, 'Stack position'), h('select', { onchange: e => { l.order = +e.target.value; editor.changed(); renderLevels(); } }, [[-2, 'Below basement'], [-1, 'Basement'], [0, 'Ground floor'], [1, '1st floor'], [2, '2nd floor'], [3, 'Attic / 3rd'], [4, 'Above']].map(([v, t]) => h('option', { value: v, selected: v === l.order }, t)))),
       !l.underlays.elec && l.underlays.plan ? h('button', { class: 'small', onclick: () => uploadUnderlayModal(l, 'elec') }, '⚡ Add situatieschema') : null,
       project.levels.length > 1 ? h('button', { class: 'small danger', style: { marginTop: '6px' }, onclick: () => { if (confirm(`Remove level “${l.name}”?`)) { project.levels = project.levels.filter(x => x !== l); editor.changed(); editor.setLevel(sortedLevels(project)[0].id); } } }, 'Remove level') : null].filter(Boolean));
@@ -397,11 +449,14 @@ function tabEditor(project, body, save, tab, q) {
     const txt = (label, key) => h('div', { class: 'row' }, h('label', {}, label), h('input', { value: s.item[key] || '', onchange: e => editor.update({ [key]: e.target.value }) }));
     const del = h('button', { class: 'small danger', onclick: () => editor.deleteSelected() }, 'Delete');
     if (s.type === 'wall') propsBox.append(h('h4', {}, 'Wall'), num('Thickness (m)', 't', .01), h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: 'level height', value: s.item.h || '', onchange: e => editor.update({ h: +e.target.value || undefined }) })), h('div', { class: 'muted' }, `Length ${wallLen(s.item).toFixed(2)} m`), del);
-    if (s.type === 'opening') propsBox.append(h('h4', {}, 'Door / window'), h('div', { class: 'row' }, h('label', {}, 'Type'), h('select', { onchange: e => editor.update({ type: e.target.value }) }, ['door', 'window', 'opening', 'garage'].map(t => h('option', { value: t, selected: s.item.type === t }, t)))), num('Width (m)', 'width'), num('Sill height', 'sill'), num('Height (m)', 'height'), num('Position (m)', 'pos'), s.item.detected ? h('div', { class: 'muted' }, 'Auto-detected gap – check the type.') : null, del);
+    if (s.type === 'opening') propsBox.append(h('h4', {}, 'Door / window'), h('div', { class: 'row' }, h('label', {}, 'Type'), h('select', { onchange: e => editor.update({ type: e.target.value }) }, ['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup'].map(t => h('option', { value: t, selected: s.item.type === t }, t)))), num('Width (m)', 'width'), num('Sill height', 'sill'), num('Height (m)', 'height'), num('Position (m)', 'pos'), s.item.detected ? h('div', { class: 'muted' }, 'Auto-detected gap – check the type.') : null, del);
+    if (s.type === 'column') propsBox.append(h('h4', {}, 'Column'), num('Width (m)', 'w', .05), s.item.round ? null : num('Depth (m)', 'd', .05), num('Height (m)', 'h', .1), h('div', { class: 'row chk' }, h('label', {}, 'Round'), h('input', { type: 'checkbox', checked: !!s.item.round, onchange: e => editor.update({ round: e.target.checked }) })), h('div', { class: 'muted' }, 'Height 0 = level height.'), del);
+    if (s.type === 'room') propsBox.append(h('h4', {}, 'Room / zone label'), txt('Name', 'text'), del);
     if (s.type === 'symbol') {
       const def = getSymbol(s.item.type);
       propsBox.append(h('h4', {}, 'Electrical symbol'), h('div', { class: 'row' }, h('div', { html: def ? svgMarkup(def, 28) : '', style: { color: '#fff' } }), h('select', { onchange: e => editor.update({ type: e.target.value }) }, allSymbols().map(d => h('option', { value: d.id, selected: d.id === s.item.type }, d.nl)))),
-        txt('Label', 'label'), txt('Circuit', 'circuit'), def && def.mount !== 'ceiling' ? h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, value: s.item.z ?? def.h, onchange: e => editor.update({ z: +e.target.value }) })) : null,
+        txt('Label', 'label'), txt('Circuit', 'circuit'), def ? h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: def.mount === 'ceiling' ? 'ceiling' : '', value: s.item.z ?? (def.mount === 'ceiling' ? '' : def.h), onchange: e => editor.update({ z: e.target.value === '' ? undefined : +e.target.value }) })) : null,
+        def && def.linear ? h('div', { class: 'row' }, h('label', {}, 'Length (m)'), h('input', { type: 'number', step: .5, value: s.item.len ?? def.len, onchange: e => editor.update({ len: +e.target.value }) })) : null,
         h('div', { class: 'row' }, h('label', {}, 'Facing (°)'), h('input', { type: 'number', step: 15, value: Math.round(((s.item.angle || 0) * 180 / Math.PI) % 360), onchange: e => editor.update({ angle: +e.target.value * Math.PI / 180 }) })),
         def ? h('div', { class: 'muted' }, `${def.en} · ${def.fr}`) : null, del);
     }

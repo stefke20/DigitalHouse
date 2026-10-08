@@ -67,7 +67,7 @@ function mergeRects(rs, maxThick) {
  * @param {number} pxPerM  pixels per metre of the raster
  * @returns {{walls:Array, openings:Array}} in metres, relative to the raster's top-left corner
  */
-export function detectWalls(src, pxPerM, { sensitivity = 0 } = {}) {
+export function detectWalls(src, pxPerM, { sensitivity = 0, industrial = false } = {}) {
   const sw = src.width, sh = src.height;
   const f = Math.max(1, Math.floor(pxPerM / 60));       // min-pool factor so thin lines survive
   const W = Math.floor(sw / f), H = Math.floor(sh / f);
@@ -92,7 +92,7 @@ export function detectWalls(src, pxPerM, { sensitivity = 0 } = {}) {
   const q = pxPerM / f;                                   // work-grid cells per metre
   const minLen = Math.max(6, Math.round(0.6 * q));
   const thinMax = Math.max(2, Math.round(0.06 * q));
-  const solidMax = Math.round(0.6 * q);
+  const solidMax = Math.round((industrial ? 1.0 : 0.6) * q);
   const orient = (rs, o) => {
     rs = mergeRects(rs, solidMax);
     const thin = rs.filter(r => r.c1 - r.c0 <= thinMax), solid = rs.filter(r => r.c1 - r.c0 > thinMax && r.c1 - r.c0 <= solidMax);
@@ -138,7 +138,7 @@ export function detectWalls(src, pxPerM, { sensitivity = 0 } = {}) {
       if (Math.abs(ax - bx) > 0.07 || Math.abs(a.t - b.t) > 0.08) continue;
       const [a0, a1] = h ? [a.x1, a.x2] : [a.y1, a.y2], [b0, b1] = h ? [b.x1, b.x2] : [b.y1, b.y2];
       const gap = Math.max(a0, b0) - Math.min(a1, b1);
-      if (gap > 3.6) continue;
+      if (gap > (industrial ? 9 : 3.6)) continue;
       if (gap > 0.04 && gap < 0.4) continue;
       const n0 = Math.min(a0, b0), n1 = Math.max(a1, b1);
       const ops = a.op.concat(b.op);
@@ -147,7 +147,10 @@ export function detectWalls(src, pxPerM, { sensitivity = 0 } = {}) {
         const axis = (ax + bx) / 2;
         const exterior = (h ? Math.min(Math.abs(axis - by0), Math.abs(axis - by1)) : Math.min(Math.abs(axis - bx0), Math.abs(axis - bx1))) < 0.6;
         let type = 'door', sill = 0, hh = 2.1;
-        if (w > 1.2) { type = exterior ? 'window' : 'opening'; if (type === 'window') { sill = 0.9; hh = 1.3; } }
+        if (industrial && exterior && w >= 3.2) { type = 'sectional'; hh = 4.2; }
+        else if (industrial && exterior && w >= 2.2) { type = 'dock'; sill = 1.2; hh = 2.8; }
+        else if (industrial && !exterior && w > 1.2) { type = 'opening'; hh = 3; }
+        else if (w > 1.2) { type = exterior ? 'window' : 'opening'; if (type === 'window') { sill = 0.9; hh = 1.3; } }
         else if (exterior && w < 0.8) { type = 'window'; sill = 1.0; hh = 1.1; }
         ops.push({ s: g0, e: g1, type, sill, height: hh });
       }
