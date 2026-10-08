@@ -4,34 +4,15 @@ import { LEVEL_PRESETS, presetsFor, newLevel, newProject, sortedLevels, wallLen,
 import { SYMBOLS, CATEGORIES, allSymbols, getSymbol, svgMarkup, loadCustomSymbols, saveCustomSymbol, removeCustomSymbol } from './symbols.js';
 import { rasterize, isPdf, pdfPageCount } from './files.js';
 import { demoProject, demoIndustrial } from './demo.js';
+import { analyze, buildProject } from './pipeline.js';
+import { computeStats } from './stats.js';
+import { buildReport, buildCsv } from './report.js';
+import { autoWire, needsWiring, isLamp, isSwitch } from './wiring.js';
+import { getImage, saveNow, loadProject, countSyms, storeDoc, addUnderlay } from './store.js';
 
 const view = document.getElementById('view');
 let cleanup = null, pendingFiles = [];
-const DOC_CATS = { floorplan: 'Grondplan (floor plan)', situatieschema: 'Situatieschema', eendraadschema: 'Eendraadschema (single-line diagram)', keuring: 'Keuringsverslag (AREI inspection)', epc: 'EPC / energy certificate', other: 'Other' };
-
-/* ---------------- data helpers ---------------- */
-const imgCache = new Map();
-const getImage = docId => {
-  if (!imgCache.has(docId)) imgCache.set(docId, db.get('docs', docId).then(d => d ? createImageBitmap(d.blob) : null));
-  return imgCache.get(docId);
-};
-const saveNow = p => { p.updated = Date.now(); return db.put('projects', JSON.parse(JSON.stringify(p))); };
-const loadProject = async id => { const p = await db.get('projects', id); return p && normalizeProject(p); };
-const countSyms = p => p.levels.reduce((n, l) => n + l.symbols.length, 0);
-async function storeDoc({ projectId, levelId = null, category, file, blob, role = 'original', name }) {
-  const b = blob || file;
-  const d = { id: uid('doc'), projectId, levelId, category, role, name: name || file.name, mime: b.type || 'application/octet-stream', size: b.size, blob: b, created: Date.now() };
-  await db.put('docs', d); return d;
-}
-async function addUnderlay(project, level, kind, file, page = 1) {
-  const r = await rasterize(file, page);
-  const orig = await storeDoc({ projectId: project.id, levelId: level.id, category: kind === 'plan' ? 'floorplan' : 'situatieschema', file });
-  const ul = await storeDoc({ projectId: project.id, levelId: level.id, category: kind === 'plan' ? 'floorplan' : 'situatieschema', blob: r.blob, role: 'underlay', name: file.name + '.png' });
-  const ind = project.settings && project.settings.type === 'industrial';
-  const pxPerM = r.paperPxPerMm ? r.paperPxPerMm * (ind ? 5 : 10) : Math.max(r.w, r.h) / (ind ? 70 : 14); // rough guess (1:200 / 1:100) – refined by OCR or calibration
-  const prev = level.underlays.plan;
-  level.underlays[kind] = { docId: ul.id, origId: orig.id, w: r.w, h: r.h, pxPerM, ox: prev && kind === 'elec' ? prev.ox : 0, oy: prev && kind === 'elec' ? prev.oy : 0, calibrated: false, paperPxPerMm: r.paperPxPerMm };
-}
+const DOC_CATS = { facade: 'Gevelplan (facade drawing)', site: 'Inplantingsplan (site plan)', floorplan: 'Grondplan (floor plan)', situatieschema: 'Situatieschema', eendraadschema: 'Eendraadschema (single-line diagram)', keuring: 'Keuringsverslag (AREI inspection)', epc: 'EPC / energy certificate', other: 'Other' };
 
 /* ---------------- router ---------------- */
 async function route() {
@@ -44,6 +25,7 @@ async function route() {
   try {
     if (!parts.length) return pageHome();
     if (parts[0] === 'new') return pageWizard();
+    if (parts[0] === 'import') return pageImport();
     if (parts[0] === 'projects') return pageProjects();
     if (parts[0] === 'library') return pageLibrary();
     if (parts[0] === 'symbols') return pageSymbols();
@@ -54,29 +36,40 @@ async function route() {
 window.addEventListener('hashchange', route);
 
 /* ---------------- landing ---------------- */
+const IMPORT_ACCEPT = '.pdf,.png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.tif,.tiff,.docx,.xlsx,.dwg';
+async function filesFromDrop(dt) {
+  const out = [];
+  const walk = async (entry, path = '') => {
+    if (entry.isFile) await new Promise(r => entry.file(f => { Object.defineProperty(f, 'webkitRelativePath', { value: path + f.name }); out.push(f); r(); }, r));
+    else if (entry.isDirectory) { const rd = entry.createReader(); let batch; do { batch = await new Promise(r => rd.readEntries(r, () => r([]))); for (const e of batch) await walk(e, path + entry.name + '/'); } while (batch.length); }
+  };
+  const entries = [...(dt.items || [])].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (entries.length) for (const e of entries) await walk(e); else out.push(...dt.files);
+  return out.filter(f => !f.name.startsWith('.'));
+}
 function pageHome() {
-  const input = h('input', { type: 'file', multiple: true, accept: '.pdf,image/*', style: { display: 'none' }, onchange: () => go(input.files) });
-  const go = files => { pendingFiles = [...files]; location.hash = '#/new'; };
+  const go = files => { if (!files.length) return; pendingFiles = [...files]; location.hash = '#/import'; };
+  const input = h('input', { type: 'file', multiple: true, accept: IMPORT_ACCEPT, style: { display: 'none' }, onchange: () => go(input.files) });
+  const folder = h('input', { type: 'file', webkitdirectory: true, style: { display: 'none' }, onchange: () => go([...folder.files].filter(f => !f.name.startsWith('.'))) });
   const cta = h('label', { class: 'dropcta' },
     h('div', { class: 'ico' }, '📐'), h('div', { class: 'big' }, 'Click here to upload your plan and start visualizing'),
-    h('div', { class: 'muted' }, 'or drop your grondplan (PDF, PNG, JPG) here – every floor can be its own file'), input);
-  cta.addEventListener('click', e => { if (e.target === cta || cta.contains(e.target)) { e.preventDefault(); location.hash = '#/new'; } });
+    h('div', { class: 'muted' }, 'or drop all your house documents – plans, situatieschema, gevelplannen, a whole folder – and we build the rest'), input);
   ['dragover', 'dragenter'].forEach(ev => cta.addEventListener(ev, e => { e.preventDefault(); cta.classList.add('over'); }));
   cta.addEventListener('dragleave', () => cta.classList.remove('over'));
-  cta.addEventListener('drop', e => { e.preventDefault(); go(e.dataTransfer.files); });
+  cta.addEventListener('drop', async e => { e.preventDefault(); go(await filesFromDrop(e.dataTransfer)); });
   const step = (n, t, d) => h('div', { class: 'card' }, h('div', { class: 'num' }, n), h('h3', {}, t), h('div', { class: 'muted' }, d));
   view.append(h('div', {},
     h('section', { class: 'hero' },
       h('h1', {}, 'Your house, ', h('em', {}, 'documented'), ' and seen in 3D'),
       h('p', {}, 'A digital library for plans, situatieschema’s and eendraadschema’s. Turn floor plans of every level into one scaled 3D model – with every lamp, switch and socket in its place.'),
       cta,
-      h('p', { style: { marginTop: '18px', fontSize: '14px' } }, 'No plan at hand? ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(); } }, 'Open the demo house'), ' · ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(true); } }, 'Open the industrial demo'), ' · ', h('a', { href: '#/projects' }, 'My Projects'))),
+      h('p', { style: { marginTop: '18px', fontSize: '14px' } }, h('button', { class: 'small', onclick: () => folder.click() }, '📁 Choose a whole folder', folder), ' ', h('a', { class: 'btn small', href: '#/new' }, 'Set up manually, level by level'), h('br'), h('span', { style: { display: 'inline-block', marginTop: '14px' } }, 'No plan at hand? '), h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(); } }, 'Open the demo house'), ' · ', h('a', { href: '#', onclick: async e => { e.preventDefault(); await loadDemo(true); } }, 'Open the industrial demo'), ' · ', h('a', { href: '#/projects' }, 'My Projects'))),
     h('div', { class: 'wrap', style: { paddingTop: 0 } },
       h('div', { class: 'steps' },
-        step(1, 'Upload every level', 'Basement, ground floor, first floor… Each level is usually its own document – HouseVault stacks them into one building.'),
-        step(2, 'Set the scale & trace', 'Calibrate with one known distance. Walls are detected automatically from clean plans; doors and windows are placed on the walls.'),
-        step(3, 'Add the electrical plan', 'Upload the situatieschema and place symbols from the Belgian (AREI) icon library – each type keeps its own identity in 3D.'),
-        step(4, 'Explore', 'Orbit, zoom, peel the building layer by layer, cut sections, explode the floors.')))));
+        step(1, 'Drop your documents', 'Floor plans per level, situatieschema, gevelplannen, inplantingsplan, eendraadschema, EPC… HouseVault recognises what each file is.'),
+        step(2, 'It builds the house', 'Scale and room names are read with OCR, walls and doors detected, levels stacked, facades and garden added.'),
+        step(3, 'Light it up', 'Switches are wired to the lamps of their room – flick the living-room switch and watch the lights come on. Day, night and sun study.'),
+        step(4, 'Explore like an architect', 'Peel layer by layer, cut sections, check room areas, highlight a circuit, export the report.')))));
 }
 async function loadDemo(industrial = false) {
   const p = industrial ? demoIndustrial() : demoProject();
@@ -164,12 +157,60 @@ function pageWizard() {
     h('div', { style: { marginTop: '28px', display: 'flex', flexDirection: 'column', gap: '10px' } }, bar, status, h('div', {}, go))));
 }
 
+/* ---------------- smart import ---------------- */
+const TYPE_LABEL = { plan: 'Floor plan', elec: 'Situatieschema (electrical plan)', facade: 'Facade drawing (gevelplan)', site: 'Site plan (inplantingsplan)', single: 'Eendraadschema', keuring: 'Inspection report', epc: 'EPC', other: 'Other document' };
+const LEVEL_LABEL = { basement: 'Basement', ground: 'Ground floor', first: 'First floor', second: 'Second floor', attic: 'Attic' };
+async function pageImport() {
+  const files = pendingFiles; pendingFiles = [];
+  const wrap = h('div', { class: 'wrap', style: { maxWidth: '1000px' } }); view.append(wrap);
+  if (!files.length) {
+    const go = fs => { if (!fs.length) return; pendingFiles = [...fs]; route(); };
+    const input = h('input', { type: 'file', multiple: true, accept: IMPORT_ACCEPT, style: { display: 'none' }, onchange: () => go(input.files) });
+    const folder = h('input', { type: 'file', webkitdirectory: true, style: { display: 'none' }, onchange: () => go([...folder.files].filter(f => !f.name.startsWith('.'))) });
+    const dz = h('label', { class: 'dropcta' }, h('div', { class: 'ico' }, '📂'), h('div', { class: 'big' }, 'Drop your house documents here'), h('div', { class: 'muted' }, 'plans, situatieschema, gevelplannen, inplantingsplan, eendraadschema… (PDF or images)'), input);
+    ['dragover', 'dragenter'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('over'); }));
+    dz.addEventListener('drop', async e => { e.preventDefault(); go(await filesFromDrop(e.dataTransfer)); });
+    wrap.append(h('h1', {}, 'Upload your house documents'), dz, h('p', { style: { textAlign: 'center' } }, h('button', { onclick: () => folder.click() }, '📁 Choose a whole folder', folder), ' ', h('a', { class: 'btn', href: '#/new' }, 'Set up manually, level by level')));
+    return;
+  }
+  wrap.append(h('h1', {}, 'Is this what I should build from?'), h('p', { class: 'muted' }, `Analysing ${files.length} file${files.length === 1 ? '' : 's'}…`));
+  const items = await analyze(files, t => { wrap.lastChild.textContent = t; });
+  const folderName = files[0].webkitRelativePath ? files[0].webkitRelativePath.split('/')[0] : '';
+  const looksIndustrial = items.some(i => /loods|magazijn|industr|bedrijf|warehouse|werkplaats|fabriek|hal\b/i.test(i.name));
+  wrap.innerHTML = '';
+  const nameIn = h('input', { value: folderName || 'My house', style: { width: '260px' } });
+  const typeSel = h('select', {}, h('option', { value: 'residential' }, 'House / apartment'), h('option', { value: 'industrial', selected: looksIndustrial }, 'Industrial / commercial building'));
+  const tbody = h('tbody');
+  const sel = (opts, val, on) => h('select', { onchange: e => on(e.target.value) }, opts.map(([v, t]) => h('option', { value: v, selected: v === (val || '') }, t)));
+  function renderRows() {
+    tbody.innerHTML = '';
+    for (const it of items) {
+      tbody.append(h('tr', {}, h('td', {}, it.name, it.guessed ? h('span', { class: 'pill', style: { marginLeft: '6px' } }, 'level guessed') : null),
+        h('td', {}, sel(Object.entries(TYPE_LABEL), it.type, v => { it.type = v; renderRows(); })),
+        h('td', {}, it.type === 'plan' || it.type === 'elec' ? sel([['', 'auto'], ...Object.entries(LEVEL_LABEL)], it.level, v => it.level = v || null) : it.type === 'facade' ? sel([['', 'auto'], ['front', 'Front'], ['back', 'Back'], ['left', 'Left'], ['right', 'Right']], it.side, v => it.side = v || null) : '—')));
+    }
+  }
+  renderRows();
+  const log = h('div', { class: 'muted' }), bar = h('div', { class: 'progress', style: { display: 'none' } }, h('div'));
+  const go = h('button', { class: 'primary', onclick: async () => {
+    go.disabled = true; bar.style.display = 'block';
+    try {
+      const p = await buildProject(items, { name: nameIn.value.trim() || 'My house', ptype: typeSel.value, onProgress: (t, f) => { log.textContent = t; bar.firstChild.style.width = Math.round(f * 100) + '%'; } });
+      location.hash = `#/project/${p.id}/3d?built=1`;
+    } catch (e) { console.error(e); toast(e.message, 'err'); log.textContent = e.message; go.disabled = false; }
+  } }, '🏠 Build my house');
+  wrap.append(h('h1', {}, 'Is this what I should build from?'), h('p', { class: 'muted' }, 'I recognised your files from their names (and the text inside PDFs). Fix anything that is wrong, then build – scale, walls, doors, windows, room names, facades and the garden are interpreted automatically and can be corrected afterwards.'),
+    h('div', { class: 'form-row' }, h('div', {}, h('label', {}, 'Project name'), nameIn), h('div', {}, h('label', {}, 'Property type'), typeSel)),
+    h('table', {}, h('thead', {}, h('tr', {}, ['File', 'What is it?', 'Level / side'].map(t => h('th', {}, t)))), tbody),
+    h('div', { style: { marginTop: '22px', display: 'flex', flexDirection: 'column', gap: '10px' } }, bar, log, h('div', {}, go, ' ', h('a', { class: 'btn', href: '#/import' }, 'Start over'))));
+}
+
 /* ---------------- projects ---------------- */
 async function pageProjects() {
   const projects = (await db.getAll('projects')).sort((a, b) => b.updated - a.updated);
   const wrap = h('div', { class: 'wrap' });
   wrap.append(h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '18px' } }, h('h1', { style: { margin: 0, flex: 1 } }, 'My Projects'),
-    h('button', { onclick: () => loadDemo() }, 'Demo house'), h('button', { onclick: () => loadDemo(true) }, 'Industrial demo'), h('a', { class: 'btn primary', href: '#/new' }, '+ New project')));
+    h('button', { onclick: () => loadDemo() }, 'Demo house'), h('button', { onclick: () => loadDemo(true) }, 'Industrial demo'), h('a', { class: 'btn primary', href: '#/import' }, '+ New project')));
   if (!projects.length) wrap.append(h('div', { class: 'empty' }, h('div', { style: { fontSize: '44px' } }, '🏠'), h('h3', {}, 'No projects yet'), 'Upload a floor plan to create your first 3D house.'));
   const grid = h('div', { class: 'grid' });
   for (const p of projects) {
@@ -201,7 +242,9 @@ async function pageProject(id, tab, q) {
   const tabs = h('div', { class: 'tabs' }, [['3d', '3D view'], ['plans', 'Floor plans'], ['electrical', 'Electrical'], ['docs', 'Documents']].map(([k, t]) => h('a', { href: `#/project/${id}/${k}`, class: k === tab ? 'active' : '' }, t)));
   const body = h('div', { class: 'projbody' });
   const bar = h('div', { class: 'projbar' }, h('a', { href: '#/projects', class: 'muted' }, '← Projects'), nameIn, tabs, h('div', { style: { flex: 1 } }),
-    h('button', { class: 'small', onclick: () => exportProject(project) }, '⬇ Export'),
+    h('button', { class: 'small', title: 'Printable overview: areas, rooms, devices per circuit', onclick: () => download(new Blob([buildReport(project)], { type: 'text/html' }), project.name.replace(/\W+/g, '_') + '_report.html') }, '📄 Report'),
+    h('button', { class: 'small', title: 'Every electrical symbol with room, circuit and height (Excel-friendly)', onclick: () => download(new Blob([buildCsv(project)], { type: 'text/csv' }), project.name.replace(/\W+/g, '_') + '_devices.csv') }, '📊 Device list'),
+    h('button', { class: 'small', onclick: () => exportProject(project) }, '⬇ Backup'),
     h('a', { class: 'btn small primary', href: '#/projects', onclick: async () => { await saveNow(project); toast('Saved – your visualization is in My Projects', 'ok'); } }, 'Done'));
   view.append(h('div', { class: 'proj' }, bar, body));
   let inner = null;
@@ -224,7 +267,8 @@ function tab3d(project, body, save) {
   body.append(host, side);
   import('./view3d.js').then(({ Viewer }) => {
     if (dead) return;
-    viewer = new Viewer(host, { getImage });
+    if (needsWiring(project)) { autoWire(project); saveNow(project); }
+    viewer = new Viewer(host, { getImage, onLights: () => fillLights() });
     viewer.set({ roof: project.settings.roof !== false });
     viewer.setProject(project);
     buildPanel();
@@ -234,8 +278,33 @@ function tab3d(project, body, save) {
 
   const levels = sortedLevels(project);
   if (!levels.some(l => l.walls.length)) host.append(h('div', { class: 'hint', style: { left: '12px', top: '12px', bottom: 'auto' } }, 'Nothing to show yet – ', h('a', { href: `#/project/${project.id}/plans` }, 'trace the walls in Floor plans'), '.'));
+  let playTimer = null; const buildPanelHour = () => { };
+  let lightHolder = null;
+  function fillLights() {
+    if (!lightHolder || !viewer) return;
+    lightHolder.innerHTML = '';
+    const groups = viewer.groupsInfo().filter(g => viewer.opts.visible.has(g.levelId)).sort((a, b) => a.levelName.localeCompare(b.levelName) || a.name.localeCompare(b.name));
+    if (!groups.length) return;
+    const night = h('input', { type: 'checkbox', id: 'cknight', checked: viewer.opts.night, onchange: e => viewer.set({ night: e.target.checked }) });
+    const list = h('div');
+    for (const g of groups) {
+      list.append(h('div', { class: 'layer' + (g.value > 0 ? '' : ' off'), style: { flexWrap: 'wrap' } },
+        h('button', { class: 'small' + (g.value > 0 ? ' active' : ''), title: 'Switch this group on / off', onclick: () => viewer.toggleGroup(g.levelId, g.ctl) }, g.value > 0 ? '💡 On' : '○ Off'),
+        h('span', { class: 'nm', style: { fontSize: '12.5px' } }, g.name, h('span', { class: 'muted' }, ` · ${g.levelName} · ${g.count}`)),
+        g.dimmer ? h('input', { type: 'range', min: .1, max: 1, step: .05, value: g.value || 1, style: { width: '100%' }, title: 'Dimmer', oninput: e => { viewer.lightState.set(g.key, +e.target.value); viewer.updateLights(); } }) : null));
+    }
+    lightHolder.append(h('h4', {}, 'Lighting'),
+      h('div', { class: 'row chk' }, h('label', { for: 'cknight' }, '🌙 Night mode'), night),
+      h('div', { class: 'row' }, h('button', { class: 'small primary', onclick: () => { viewer.set({ night: true }); viewer.allLights(true); } }, 'Evening: all lights on'), h('button', { class: 'small', onclick: () => viewer.allLights(false) }, 'All off')),
+      list, h('div', { class: 'muted', style: { fontSize: '12px', margin: '4px 0 6px' } }, 'Click any switch or lamp in the 3D view to flick it. Wiring was guessed from the plan (a switch controls the lamps of the room it faces) – fix it per symbol in the Electrical tab.'));
+  }
   function buildPanel() {
     side.innerHTML = '';
+    if (project.importReport && project.importReport.length && !project.reportSeen) {
+      side.append(h('div', { class: 'card', style: { padding: '10px', borderColor: '#3b5da3' } }, h('b', {}, '🏠 What I built – please check'),
+        h('div', { style: { margin: '6px 0', fontSize: '12.5px', display: 'flex', flexDirection: 'column', gap: '4px' } }, project.importReport.map(r => h('div', { style: { color: r.status === 'warn' ? '#fbbf24' : '#a7f3d0' } }, (r.status === 'warn' ? '⚠ ' : '✓ ') + r.text))),
+        h('div', { class: 'row' }, h('a', { class: 'btn small', href: `#/project/${project.id}/plans` }, 'Review floor plans'), h('button', { class: 'small', onclick: () => { project.reportSeen = true; save(); buildPanel(); } }, 'Got it'))));
+    }
     const vis = viewer.opts.visible;
     const refresh = () => { viewer.set({ visible: vis }); buildPanel(); };
     const lay = h('div');
@@ -247,6 +316,7 @@ function tab3d(project, body, save) {
         h('button', { title: 'Show this level and everything below', onclick: () => { vis.clear(); levels.filter(l => l.order <= lv.order).forEach(l => vis.add(l.id)); refresh(); } }, '↧ Up to')));
     }
     side.append(h('div', {}, h('h4', {}, 'Layers'), lay, h('button', { class: 'small', onclick: () => { levels.forEach(l => vis.add(l.id)); refresh(); } }, 'Show all')));
+    lightHolder = h('div'); side.append(lightHolder); fillLights();
     const sl = (label, key, min, max, step, val) => h('div', { class: 'row' }, h('label', {}, label), h('input', { type: 'range', min, max, step, value: val, oninput: e => viewer.set({ [key]: +e.target.value }) }));
     const ck = (label, key) => h('div', { class: 'row chk' }, h('label', { for: 'ck' + key }, label), h('input', { type: 'checkbox', id: 'ck' + key, checked: viewer.opts[key], onchange: e => { viewer.set({ [key]: e.target.checked }); if (key === 'roof') { project.settings.roof = e.target.checked; save(); } } }));
     side.append(h('div', {}, h('h4', {}, 'Explore'),
@@ -255,6 +325,39 @@ function tab3d(project, body, save) {
     const st = project.settings;
     side.append(h('div', {}, h('h4', {}, 'Roof'), h('div', { class: 'row' }, h('label', {}, 'Shape'), h('select', { onchange: e => { st.roofType = e.target.value; save(); viewer.build(); } }, [['flat', 'Flat'], ['gable', 'Gable (two-pitch)']].map(([v, t]) => h('option', { value: v, selected: st.roofType === v }, t)))),
       h('div', { class: 'row' }, h('label', {}, 'Pitch ' + (st.roofPitch || 8) + '°'), h('input', { type: 'range', min: 3, max: 45, step: 1, value: st.roofPitch || 8, onchange: e => { st.roofPitch = +e.target.value; save(); viewer.build(); buildPanel(); } }))));
+    const fac = project.facades || (project.facades = {});
+    const rebuild = () => { save(); viewer.build(); };
+    const sides = [['front', 'Front (voorgevel)'], ['back', 'Back (achtergevel)'], ['left', 'Left'], ['right', 'Right']];
+    const ground = project.levels.find(l => l.order >= 0) || project.levels[0];
+    side.append(h('div', {}, h('h4', {}, 'Exterior'),
+      h('div', { class: 'row' }, h('label', {}, 'Wall colour'), h('input', { type: 'color', value: st.wallColor || '#e8e2d6', style: { padding: 0, height: '28px', flex: '0 0 48px' }, onchange: e => { st.wallColor = e.target.value; rebuild(); } }),
+        h('select', { onchange: e => { st.wallPattern = e.target.value; rebuild(); } }, [['plain', 'Render'], ['brick', 'Brick'], ['cladding', 'Cladding']].map(([v, t]) => h('option', { value: v, selected: (st.wallPattern || 'plain') === v }, t)))),
+      h('div', { class: 'row' }, h('label', {}, 'Roof colour'), h('input', { type: 'color', value: st.roofColor || '#5b6578', style: { padding: 0, height: '28px', flex: '0 0 48px' }, onchange: e => { st.roofColor = e.target.value; rebuild(); } })),
+      h('div', { class: 'row chk' }, h('label', { for: 'ckgarden' }, '🌳 Garden, lawn & trees'), h('input', { type: 'checkbox', id: 'ckgarden', checked: st.garden !== false, onchange: e => { st.garden = e.target.checked; rebuild(); } })),
+      ground && ground.underlays.site ? h('div', { class: 'row chk' }, h('label', { for: 'cksite' }, 'Site plan on the ground'), h('input', { type: 'checkbox', id: 'cksite', checked: st.siteOn !== false, onchange: e => { st.siteOn = e.target.checked; rebuild(); } })) : null,
+      h('div', { class: 'row chk' }, h('label', { for: 'ckfac' }, 'Facade drawings on the walls'), h('input', { type: 'checkbox', id: 'ckfac', checked: viewer.opts.facades, onchange: e => viewer.set({ facades: e.target.checked }) })),
+      h('div', { class: 'muted', style: { fontSize: '12px', marginBottom: '4px' } }, 'Gevelplannen (elevations) are stretched over the matching side of the building – works best for rectangular buildings.'),
+      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '5px' } }, sides.map(([k, t]) => h('button', { class: 'small' + (fac[k] ? ' active' : ''), onclick: () => facadeModal(project, k, t, () => { save(); viewer.build(); buildPanel(); }) }, (fac[k] ? '✓ ' : '+ ') + t))),
+      ground && !ground.underlays.site ? h('div', { style: { marginTop: '6px' } }, h('a', { class: 'btn small', href: `#/project/${project.id}/plans?site=1` }, '+ Site plan (inplantingsplan)')) : null));
+    const stats = computeStats(project), MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    side.append(h('div', {}, h('h4', {}, 'Plan insights'),
+      h('div', { class: 'row', style: { flexWrap: 'wrap', gap: '6px' } }, [[stats.gfa.toFixed(0) + ' m²', 'floor area'], [stats.volume.toFixed(0) + ' m³', 'volume'], [stats.rooms, 'rooms'], [stats.windows, 'windows']].map(([v, t]) => h('span', { class: 'pill' }, h('b', { style: { color: '#fff' } }, v), ' ' + t))),
+      ...stats.levels.filter(l => l.rooms.length && viewer.opts.visible.has(l.id)).map(l => h('details', {}, h('summary', { style: { cursor: 'pointer', margin: '4px 0' } }, `${l.name} – ${l.area.toFixed(0)} m²`),
+        h('div', { style: { fontSize: '12.5px' } }, l.rooms.map(r => h('div', { style: { display: 'flex', gap: '6px', padding: '1px 0' } }, h('span', { style: { flex: 1 } }, r.name), h('span', {}, r.area.toFixed(1) + ' m²'), h('span', { class: 'muted', title: 'window area ÷ floor area (daylight indicator, ~10–20 % is typical for living rooms)', style: { width: '38px', textAlign: 'right' } }, r.windowArea ? Math.round(r.daylight * 100) + '%' : '–')))))),
+      ck('Areas on room labels', 'areas')));
+    const info = () => { const sp = viewer._sunInfo; return sp ? `Sun ${Math.round(sp.el * 180 / Math.PI)}° above the horizon` : viewer.opts.sunOn ? 'Sun below the horizon' : ''; };
+    const sunTxt = h('div', { class: 'muted', style: { fontSize: '12px' } }, info());
+    const hrs = v => { const hh = Math.floor(v), mm = Math.round((v - hh) * 60); return `${hh}:${String(mm).padStart(2, '0')}`; };
+    const lbHour = h('label', {}, 'Time ' + hrs(viewer.opts.hour)), lbMon = h('label', {}, 'Month ' + MONTHS[viewer.opts.month - 1]);
+    const upd = () => { viewer.applyEnvironment(); sunTxt.textContent = info(); lbHour.textContent = 'Time ' + hrs(viewer.opts.hour); lbMon.textContent = 'Month ' + MONTHS[viewer.opts.month - 1]; };
+    side.append(h('div', {}, h('h4', {}, 'Sun study'),
+      h('div', { class: 'row chk' }, h('label', { for: 'cksun' }, '☀ Sun position & shadows'), h('input', { type: 'checkbox', id: 'cksun', checked: viewer.opts.sunOn, onchange: e => { viewer.opts.sunOn = e.target.checked; upd(); } })),
+      h('div', { class: 'row' }, lbMon, h('input', { type: 'range', min: 1, max: 12, step: 1, value: viewer.opts.month, oninput: e => { viewer.opts.month = +e.target.value; viewer.opts.sunOn = true; upd(); } })),
+      h('div', { class: 'row' }, lbHour, h('input', { type: 'range', min: 5, max: 22, step: .25, value: viewer.opts.hour, oninput: e => { viewer.opts.hour = +e.target.value; viewer.opts.sunOn = true; upd(); } })),
+      h('div', { class: 'row' }, h('label', {}, 'Plan “up” faces'), h('input', { type: 'number', step: 5, value: st.north || 0, style: { width: '64px' }, title: 'Compass bearing of the top of the plan in degrees (0 = north, 90 = east, 180 = south)', onchange: e => { st.north = +e.target.value; save(); upd(); } }), h('span', { class: 'muted' }, '° (0 = north)')),
+      h('div', { class: 'row' }, h('button', { class: 'small', onclick: e => { if (playTimer) { clearInterval(playTimer); playTimer = null; e.target.textContent = '▶ Play the day'; return; } viewer.opts.sunOn = true; viewer.opts.hour = 5; e.target.textContent = '⏸ Pause'; playTimer = setInterval(() => { viewer.opts.hour += .25; if (viewer.opts.hour > 22) viewer.opts.hour = 5; upd(); buildPanelHour(); }, 140); } }, '▶ Play the day')), sunTxt));
+    const circuits = [...new Set(project.levels.filter(l => viewer.opts.visible.has(l.id)).flatMap(l => l.symbols.map(x => String(x.circuit || '')).filter(Boolean)))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (circuits.length) side.append(h('div', {}, h('h4', {}, 'Highlight a circuit (breaker)'), h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px' } }, h('button', { class: 'small' + (!viewer.opts.circuit ? ' active' : ''), onclick: () => { viewer.set({ circuit: null }); buildPanel(); } }, 'All'), circuits.map(c => h('button', { class: 'small' + (viewer.opts.circuit === c ? ' active' : ''), onclick: () => { viewer.set({ circuit: c }); buildPanel(); } }, c))), viewer.opts.circuit ? h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, `Showing only the devices on circuit ${viewer.opts.circuit}.`) : null));
     // electrical legend, grouped by category
     const counts = {};
     for (const l of levels) if (vis.has(l.id)) for (const s of l.symbols) counts[s.type] = (counts[s.type] || 0) + 1;
@@ -276,8 +379,39 @@ function tab3d(project, body, save) {
     h('button', { title: 'Save screenshot', onclick: () => fetch(viewer.snapshot()).then(r => r.blob()).then(b => download(b, project.name + '.png')) }, '📷'));
   host.append(fb);
   window.__viewer = () => viewer;
-  return () => { dead = true; if (viewer) { try { makeThumbIfNeeded(); } catch { } viewer.dispose(); } };
+  return () => { dead = true; if (playTimer) clearInterval(playTimer); if (viewer) { try { makeThumbIfNeeded(); } catch { } viewer.dispose(); } };
   function makeThumbIfNeeded() { }
+}
+
+/* ---------------- facade fitting dialog ---------------- */
+function facadeModal(project, side, title, done) {
+  const f = h('input', { type: 'file', accept: '.pdf,image/*' }), cv = h('canvas', { style: { maxWidth: '100%', border: '1px solid #2b3a57', cursor: 'crosshair', touchAction: 'none', display: 'none' } });
+  const info = h('div', { class: 'muted', style: { margin: '8px 0' } }, 'Choose the elevation drawing, then drag a box exactly around the building: left and right edge of the facade, ground line at the bottom, roof / eaves at the top.');
+  let bmp = null, blob = null, file = null, crop = null, sc = 1, drag = null;
+  const draw = () => { const x = cv.getContext('2d'); x.clearRect(0, 0, cv.width, cv.height); x.drawImage(bmp, 0, 0, cv.width, cv.height); if (crop) { x.fillStyle = 'rgba(0,0,0,.45)'; const a = crop.x0 * sc, b = crop.y0 * sc, c = crop.x1 * sc, d = crop.y1 * sc; x.fillRect(0, 0, cv.width, b); x.fillRect(0, d, cv.width, cv.height - d); x.fillRect(0, b, a, d - b); x.fillRect(c, b, cv.width - c, d - b); x.strokeStyle = '#22d3ee'; x.lineWidth = 2; x.strokeRect(a, b, c - a, d - b); } };
+  const pt = e => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * cv.width / sc, (e.clientY - r.top) / r.height * cv.height / sc]; };
+  cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); drag = pt(e); crop = { x0: drag[0], y0: drag[1], x1: drag[0], y1: drag[1] }; });
+  cv.addEventListener('pointermove', e => { if (!drag) return; const p = pt(e); crop = { x0: Math.min(drag[0], p[0]), y0: Math.min(drag[1], p[1]), x1: Math.max(drag[0], p[0]), y1: Math.max(drag[1], p[1]) }; draw(); });
+  cv.addEventListener('pointerup', () => { drag = null; });
+  f.onchange = async () => {
+    file = f.files[0]; if (!file) return; info.textContent = 'Reading…';
+    const r = await rasterize(file, 1); blob = r.blob; bmp = await createImageBitmap(blob);
+    sc = Math.min(1, 760 / bmp.width); cv.width = Math.round(bmp.width * sc); cv.height = Math.round(bmp.height * sc); cv.style.display = 'block';
+    // auto crop: bounding box of everything that is not (nearly) white
+    const t = document.createElement('canvas'), k = Math.min(1, 500 / Math.max(bmp.width, bmp.height)); t.width = Math.round(bmp.width * k); t.height = Math.round(bmp.height * k);
+    const tx = t.getContext('2d', { willReadFrequently: true }); tx.fillStyle = '#fff'; tx.fillRect(0, 0, t.width, t.height); tx.drawImage(bmp, 0, 0, t.width, t.height);
+    const d = tx.getImageData(0, 0, t.width, t.height).data; let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1;
+    for (let y = 0; y < t.height; y++) for (let x = 0; x < t.width; x++) { const i = (y * t.width + x) * 4; if (d[i] + d[i + 1] + d[i + 2] < 690) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } }
+    crop = x1 > x0 ? { x0: x0 / k, y0: y0 / k, x1: (x1 + 1) / k, y1: (y1 + 1) / k } : { x0: 0, y0: 0, x1: bmp.width, y1: bmp.height };
+    info.textContent = 'Auto-detected the drawing area – adjust the box if needed (drag a new one).'; draw();
+  };
+  const save = h('button', { class: 'primary', onclick: async () => {
+    if (!blob) return toast('Choose a file first', 'err');
+    const orig = await storeDoc({ projectId: project.id, category: 'facade', file }), ul = await storeDoc({ projectId: project.id, category: 'facade', blob, role: 'underlay', name: file.name + '.png' });
+    (project.facades ||= {})[side] = { docId: ul.id, origId: orig.id, crop }; await saveNow(project); m.close(); done(); toast(title + ' facade applied', 'ok');
+  } }, 'Apply to 3D model');
+  const rm = project.facades && project.facades[side] ? h('button', { class: 'danger', onclick: async () => { delete project.facades[side]; await saveNow(project); m.close(); done(); } }, 'Remove') : null;
+  const m = modal(h('div', { style: { width: 'min(800px,92vw)' } }, h('h3', {}, `Facade drawing – ${title}`), f, info, cv, h('div', { class: 'row', style: { marginTop: '10px' } }, save, rm)));
 }
 
 /* ---------------- editor tabs (floor plans / electrical) ---------------- */
@@ -306,11 +440,12 @@ function tabEditor(project, body, save, tab, q) {
     editor.setUnderlay(mode === 'elec' && editor.level && editor.level.underlays.elec ? 'elec' : editor.level && editor.level.underlays.plan ? 'plan' : 'none');
     editor.underlayOpacity = mode === 'elec' ? .75 : .6;
     syncUnderlayUI();
+    if (q.get('site') && editor.level && !editor.level.underlays.site) setTimeout(() => uploadUnderlayModal(editor.level, 'site'), 300);
   }
   /* toolbar */
   const tools = mode === 'plan'
-    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['sectional', '▤', 'Overhead (sectional) door'], ['dock', '🚚', 'Loading-dock door'], ['column', '▣', 'Structural column'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
-    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['teach', '🔍', 'Find look-alike symbols: box ONE example on the drawing'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)']];
+    ? [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate scale'], ['wall', '▭', 'Draw wall (W)'], ['door', '🚪', 'Door (D)'], ['window', '🪟', 'Window (N)'], ['opening', '⛶', 'Doorway / opening'], ['garage', '🅖', 'Garage door'], ['sectional', '▤', 'Overhead (sectional) door'], ['dock', '🚚', 'Loading-dock door'], ['column', '▣', 'Structural column'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)'], ['measure', '📐', 'Measure a distance'], ['moveUnderlay', '🖼', 'Move plan image'], ['alignLevel', '⇱', 'Shift whole level (align with other levels)']]
+    : [['select', '↖', 'Select / move (V)'], ['pan', '✋', 'Pan (H)'], ['calibrate', '📏', 'Calibrate situatieschema scale'], ['measure', '📐', 'Measure a distance'], ['moveUnderlay', '🖼', 'Move situatieschema image'], ['teach', '🔍', 'Find look-alike symbols: box ONE example on the drawing'], ['room', '🏷', 'Room / zone label'], ['erase', '🗑', 'Erase (E)']];
   for (const [k, ic, tip] of tools) { const b = h('button', { title: tip, onclick: () => editor && editor.setTool(k) }, ic); toolBtns[k] = b; left.append(b); }
   left.append(h('div', { class: 'sep' }), h('button', { title: 'Undo (Ctrl+Z)', onclick: () => editor && editor.undo() }, '↶'), h('button', { title: 'Redo (Ctrl+Y)', onclick: () => editor && editor.redo() }, '↷'));
 
@@ -321,7 +456,7 @@ function tabEditor(project, body, save, tab, q) {
     levelBar.append(h('button', { class: 'small', onclick: addLevelModal }, '+ Level'));
     levelBar.append(h('div', { style: { flex: 1 } }));
     const ul = h('select', { onchange: e => { editor.setUnderlay(e.target.value); syncUnderlayUI(); } },
-      h('option', { value: 'plan' }, 'Underlay: floor plan'), h('option', { value: 'elec' }, 'Underlay: situatieschema'), h('option', { value: 'none' }, 'Underlay: none'));
+      h('option', { value: 'plan' }, 'Underlay: floor plan'), h('option', { value: 'elec' }, 'Underlay: situatieschema'), currentLevel && currentLevel.underlays.site ? h('option', { value: 'site' }, 'Underlay: site plan') : null, h('option', { value: 'none' }, 'Underlay: none'));
     ul.value = editor.underlay; ulSel = ul;
     levelBar.append(ul, h('label', {}, 'Opacity'), h('input', { type: 'range', min: .1, max: 1, step: .05, value: editor.underlayOpacity, style: { width: '90px' }, oninput: e => { editor.underlayOpacity = +e.target.value; editor.draw(); } }),
       h('label', { style: { display: 'flex', gap: '4px', alignItems: 'center' } }, h('input', { type: 'checkbox', checked: editor.showBelow, onchange: e => { editor.showBelow = e.target.checked; editor.draw(); } }), 'Level below'));
@@ -336,6 +471,17 @@ function tabEditor(project, body, save, tab, q) {
   if (mode === 'elec') side.append(paletteBox);
 
 
+  function showDiscover() {
+    teachCard.style.display = 'block'; teachCard.innerHTML = '';
+    const info = h('div', { class: 'muted' }, 'Searching the drawing…'); teachCard.append(h('b', {}, '✨ Repeated symbols found'), info);
+    setTimeout(() => {
+      let cl = []; try { cl = editor.discover(); } catch (e) { console.error(e); }
+      if (!cl.length) { info.textContent = 'No repeated symbols found. Make sure the scale is set and the situatieschema is the active underlay – or use the 🔍 tool on one example.'; return; }
+      info.textContent = 'Tell me what each group is (skip letters or anything else). Wall devices snap to the wall.';
+      const rows = cl.map(c => { const s = h('select', { style: { flex: 1, minWidth: 0 } }, h('option', { value: '' }, '— skip —'), Object.entries(CATEGORIES).map(([k, i]) => h('optgroup', { label: i.nl }, allSymbols().filter(x => x.cat === k).map(x => h('option', { value: x.id }, x.nl))))); return { c, s, el: h('div', { class: 'row' }, h('img', { src: c.thumb, width: 40, height: 40, style: { background: '#fff', borderRadius: '4px' } }), h('b', {}, '×' + c.count), s) }; });
+      teachCard.append(...rows.map(r => r.el), h('div', { class: 'row' }, h('button', { class: 'primary small', onclick: () => { let n = 0; for (const r of rows) if (r.s.value) n += editor.placeItems(r.c.items, r.s.value); teachCard.style.display = 'none'; toast(`Placed ${n} symbols`, 'ok'); renderSteps(); } }, 'Place chosen groups'), h('button', { class: 'small', onclick: () => teachCard.style.display = 'none' }, 'Close')));
+    }, 40);
+  }
   function showTeach() {
     teachCard.style.display = 'block'; teachCard.innerHTML = '';
     const sel = h('select', { style: { width: '100%' } }, Object.entries(CATEGORIES).map(([c, i]) => h('optgroup', { label: i.nl }, allSymbols().filter(x => x.cat === c).map(x => h('option', { value: x.id, selected: x.id === selSym }, x.nl)))));
@@ -406,11 +552,14 @@ function tabEditor(project, body, save, tab, q) {
           h('button', { onclick: () => { if (editor.autoAlign()) { editor.fit(); toast('Aligned to another level’s top-left corner – fine-tune with ⇱', 'ok'); } else toast('Needs walls on this and another level', 'err'); } }, '⇱ Auto-align to other level'),
           h('button', { class: 'danger small', onclick: () => { if (confirm('Delete all walls, doors and windows of this level?')) { editor.pushUndo(); l.walls = []; l.openings = []; editor.changed(); editor.draw(); } } }, 'Clear walls'));
       }
+      if (!l.underlays.site && l.order >= 0 && l === (sortedLevels(project).find(x => x.order >= 0) || l)) actions.append(h('button', { onclick: () => uploadUnderlayModal(l, 'site') }, '🌳 Upload site plan (inplantingsplan)'));
       actions.append(h('button', { class: 'primary', style: { marginTop: '6px' }, onclick: async () => { await saveNow(project); toast('Saved – check My Projects for your visualization', 'ok'); location.hash = '#/projects'; } }, 'Finish & visualize →'));
     } else {
       if (!l.underlays.elec) actions.append(h('div', { class: 'banner' }, 'No situatieschema for this level yet. You can still place symbols on the floor plan.'), h('button', { onclick: () => uploadUnderlayModal(l, 'elec') }, '⚡ Upload situatieschema'));
       else if (!l.underlays.elec.calibrated) actions.append(h('div', { class: 'banner' }, 'Calibrate the situatieschema (📏), or use the move tool (🖼) to line it up with the walls. If it is the same drawing as the floor plan, set the same scale.'));
       if (l.underlays.elec) actions.append(h('button', { onclick: ocrModal }, '🔎 Read text (OCR)'));
+      if (l.underlays.elec) actions.append(h('button', { onclick: showDiscover }, '✨ Discover repeated symbols'));
+      actions.append(h('button', { onclick: () => { const r = autoWire(project, { force: confirm('Re-wire ALL switches and lamps from scratch? (Cancel = only fill in what is missing)') }); editor.changed(); toast(r.groups ? `Wired ${r.linked} lamps to ${r.groups} switched room groups` : 'Nothing to wire – add switches and lamps inside closed rooms', r.groups ? 'ok' : 'err'); } }, '🔌 Auto-wire switches → lamps'));
       renderPalette();
     }
   }
@@ -455,7 +604,8 @@ function tabEditor(project, body, save, tab, q) {
     if (s.type === 'symbol') {
       const def = getSymbol(s.item.type);
       propsBox.append(h('h4', {}, 'Electrical symbol'), h('div', { class: 'row' }, h('div', { html: def ? svgMarkup(def, 28) : '', style: { color: '#fff' } }), h('select', { onchange: e => editor.update({ type: e.target.value }) }, allSymbols().map(d => h('option', { value: d.id, selected: d.id === s.item.type }, d.nl)))),
-        txt('Label', 'label'), txt('Circuit', 'circuit'), def ? h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: def.mount === 'ceiling' ? 'ceiling' : '', value: s.item.z ?? (def.mount === 'ceiling' ? '' : def.h), onchange: e => editor.update({ z: e.target.value === '' ? undefined : +e.target.value }) })) : null,
+        txt('Label', 'label'), txt('Circuit (breaker)', 'circuit'),
+        def && (isLamp(def) || isSwitch(def)) ? txt('Switch group', 'ctl') : null, def && def.id === 'sw_double' ? txt('2nd rocker group', 'ctl2') : null, def ? h('div', { class: 'row' }, h('label', {}, 'Height (m)'), h('input', { type: 'number', step: .05, placeholder: def.mount === 'ceiling' ? 'ceiling' : '', value: s.item.z ?? (def.mount === 'ceiling' ? '' : def.h), onchange: e => editor.update({ z: e.target.value === '' ? undefined : +e.target.value }) })) : null,
         def && def.linear ? h('div', { class: 'row' }, h('label', {}, 'Length (m)'), h('input', { type: 'number', step: .5, value: s.item.len ?? def.len, onchange: e => editor.update({ len: +e.target.value }) })) : null,
         h('div', { class: 'row' }, h('label', {}, 'Facing (°)'), h('input', { type: 'number', step: 15, value: Math.round(((s.item.angle || 0) * 180 / Math.PI) % 360), onchange: e => editor.update({ angle: +e.target.value * Math.PI / 180 }) })),
         def ? h('div', { class: 'muted' }, `${def.en} · ${def.fr}`) : null, del);
@@ -465,7 +615,7 @@ function tabEditor(project, body, save, tab, q) {
   function uploadUnderlayModal(l, kind) {
     const f = h('input', { type: 'file', accept: '.pdf,image/*' }), pg = h('input', { type: 'number', value: 1, min: 1, style: { width: '70px' } });
     const go = h('button', { class: 'primary', onclick: async () => { if (!f.files[0]) return; go.disabled = true; try { await addUnderlay(project, l, kind, f.files[0], +pg.value || 1); await saveNow(project); m.close(); await editor.loadBitmaps(); editor.setUnderlay(kind); editor.fit(); renderLevels(); renderSteps(); toast('Uploaded – now set the scale', 'ok'); } catch (e) { toast(e.message, 'err'); go.disabled = false; } } }, 'Upload');
-    const m = modal(h('div', {}, h('h3', {}, kind === 'plan' ? `Floor plan for ${l.name}` : `Situatieschema for ${l.name}`), h('div', { class: 'form-row' }, f, h('div', {}, h('label', {}, 'PDF page'), pg)), go));
+    const m = modal(h('div', {}, h('h3', {}, kind === 'plan' ? `Floor plan for ${l.name}` : kind === 'site' ? `Site plan (inplantingsplan) – draped on the ground` : `Situatieschema for ${l.name}`), h('div', { class: 'form-row' }, f, h('div', {}, h('label', {}, 'PDF page'), pg)), go));
   }
   function addLevelModal() {
     const sel = h('select', {}, LEVEL_PRESETS.map((p, i) => h('option', { value: i }, p.name))), f = h('input', { type: 'file', accept: '.pdf,image/*' });

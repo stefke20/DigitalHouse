@@ -3,6 +3,7 @@ import { wallExtensions, wallLen, distPtSeg } from './model.js';
 import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 import { detectWalls } from './detect.js';
 import { findSimilar } from './match.js';
+import { discoverSymbols } from './discover.js';
 
 export const OPENING_DEFAULTS = {
   door: { width: .9, sill: 0, height: 2.05 }, window: { width: 1.2, sill: .9, height: 1.3 },
@@ -177,6 +178,8 @@ export class Editor {
       this.pushUndo(); const sz = this.project.settings.type === 'industrial' ? .5 : .3;
       const c = { id: uid('c'), x: Math.round(wx / .05) * .05, y: Math.round(wy / .05) * .05, w: sz, d: sz, round: false };
       this.level.columns.push(c); this.changed(); this.select({ type: 'column', id: c.id, item: c });
+    } else if (t === 'measure') {
+      const p = this.snapPt(wx, wy, { noGrid: true }); this.meas = (!this.meas || this.meas.b) ? { a: [p[0], p[1]] } : { ...this.meas, b: [p[0], p[1]] };
     } else if (t === 'room') {
       const text = prompt('Room / zone name:'); if (text) { this.pushUndo(); const r = { id: uid('r'), text, x: wx, y: wy }; this.level.rooms.push(r); this.changed(); this.select({ type: 'room', id: r.id, item: r }); }
     } else if (t === 'teach') {
@@ -238,7 +241,7 @@ export class Editor {
       }
       this.draw(); return;
     }
-    if (['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup', 'symbol', 'wall', 'calibrate', 'erase', 'select', 'column'].includes(this.tool)) this.draw();
+    if (['door', 'window', 'opening', 'garage', 'sectional', 'dock', 'rollup', 'symbol', 'wall', 'calibrate', 'erase', 'select', 'column', 'measure'].includes(this.tool)) this.draw();
     this.status();
   }
   pup(e) {
@@ -276,7 +279,7 @@ export class Editor {
   }
   status() {
     const { wx, wy } = this.mouse;
-    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', sectional: 'Click on an outer wall to place an overhead (sectional) door', dock: 'Click on a wall to place a loading-dock door', rollup: 'Click on a wall to place a roller shutter', column: 'Click to place a structural column', room: 'Click to name a room / zone', teach: 'Drag a box around ONE example symbol on the drawing', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
+    const hints = { select: 'Click to select · drag to move · Del deletes', wall: 'Click to place wall points · double-click / Esc to finish · Alt = no snap', door: 'Click on a wall to place a door', window: 'Click on a wall to place a window', opening: 'Click on a wall to cut a doorway', sectional: 'Click on an outer wall to place an overhead (sectional) door', dock: 'Click on a wall to place a loading-dock door', rollup: 'Click on a wall to place a roller shutter', column: 'Click to place a structural column', room: 'Click to name a room / zone', measure: 'Click two points to measure a distance (snaps to wall ends)', teach: 'Drag a box around ONE example symbol on the drawing', garage: 'Click on a wall to place a garage door', symbol: 'Click to place · R rotates · wall devices snap to the nearest wall face', calibrate: 'Click two points with a known distance', moveUnderlay: 'Drag to move the plan image', alignLevel: 'Drag to shift this whole level', erase: 'Click an item to delete it', pan: 'Drag to pan' };
     this.cb.onStatus(`${wx.toFixed(2)} m, ${wy.toFixed(2)} m  ·  ${hints[this.tool] || ''}`);
   }
 
@@ -323,6 +326,12 @@ export class Editor {
     }
     this.teachHits = null; this.teachBox = null; this.changed(); this.draw(); return n;
   }
+  /** repeated-symbol clusters on the current underlay */
+  discover() {
+    const u = this.level.underlays[this.underlay], bmp = u && this.bitmaps[u.docId]; if (!bmp) return [];
+    return discoverSymbols(bmp, u.pxPerM, this.level.walls.map(w => ({ x1: w.x1 - u.ox, y1: w.y1 - u.oy, x2: w.x2 - u.ox, y2: w.y2 - u.oy, t: w.t }))).map(c => ({ ...c, items: c.items.map(i => ({ x: u.ox + i.px / u.pxPerM, y: u.oy + i.py / u.pxPerM })) }));
+  }
+  placeItems(items, symbolId) { this.teachHits = items; return this.placeTeachHits(symbolId); }
   clearTeach() { this.teachHits = null; this.teachBox = null; this.draw(); }
   /* OCR results → scale + room labels */
   applyOcr(res, { scale = true, labels = [] } = {}) {
@@ -368,6 +377,7 @@ export class Editor {
     this.drawOverlay(ctx);
     const tb = this.drag && this.drag.kind === 'teach' ? { x0: Math.min(this.drag.a[0], this.drag.b[0]), y0: Math.min(this.drag.a[1], this.drag.b[1]), x1: Math.max(this.drag.a[0], this.drag.b[0]), y1: Math.max(this.drag.a[1], this.drag.b[1]) } : this.teachBox;
     if (tb) { const [a, b] = this.w2s(tb.x0, tb.y0), [c, d] = this.w2s(tb.x1, tb.y1); ctx.strokeStyle = '#22d3ee'; ctx.setLineDash([6, 4]); ctx.lineWidth = 2; ctx.strokeRect(a, b, c - a, d - b); ctx.setLineDash([]); }
+    if (this.meas) { const a = this.meas.a, b = this.meas.b || [this.mouse.wx, this.mouse.wy], [ax, ay] = this.w2s(...a), [bx, by] = this.w2s(...b); ctx.strokeStyle = '#a3e635'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke(); for (const [x, y] of [[ax, ay], [bx, by]]) { ctx.fillStyle = '#a3e635'; ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill(); } const L = Math.hypot(b[0] - a[0], b[1] - a[1]); ctx.font = '600 13px sans-serif'; const tx = `${L.toFixed(2)} m`; const w = ctx.measureText(tx).width + 12; ctx.fillStyle = '#0b1220e6'; ctx.fillRect((ax + bx) / 2 - w / 2, (ay + by) / 2 - 22, w, 20); ctx.fillStyle = '#d9f99d'; ctx.fillText(tx, (ax + bx) / 2 - w / 2 + 6, (ay + by) / 2 - 8); }
     if (this.teachHits) for (const h of this.teachHits) { const [x, y] = this.w2s(h.x, h.y); ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 13, 0, 7); ctx.stroke(); }
   }
   drawGrid(ctx) {

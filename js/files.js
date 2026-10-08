@@ -52,3 +52,14 @@ export async function rasterize(file, page = 1) {
   ctx.drawImage(im, 0, 0, c.width, c.height);
   return { blob: await toBlob(c), w: c.width, h: c.height, paperPxPerMm: null };
 }
+
+/** text layer of each PDF page (vector PDFs from CAD usually carry one – much cheaper than OCR) */
+export async function pdfPageTexts(file, max = 40) {
+  const lib = await pdf();
+  const doc = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const out = [];
+  for (let i = 1; i <= Math.min(doc.numPages, max); i++) {
+    try { const tc = await (await doc.getPage(i)).getTextContent(); out.push(tc.items.map(x => x.str).join(' ')); } catch { out.push(''); }
+  }
+  return out;
+}

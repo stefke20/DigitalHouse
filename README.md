@@ -14,7 +14,49 @@ npx http-server . -p 8080 -c-1      # or any static file server
 ```
 No build step. Three.js and pdf.js are vendored in `vendor/`.
 
-## Workflow
+## The easy way: drop everything
+
+On the home page click the big upload area (or drop files / a **whole folder**). HouseVault
+
+1. **recognises each file** from its name and, for PDFs, the text inside (Dutch / French / English / German keywords):
+   floor plan per level (kelder / gelijkvloers / verdieping / zolder…), situatieschema, eendraadschema, gevelplan
+   (voor- / achter- / zijgevel), inplantingsplan, EPC, keuringsverslag, other documents. You get one review screen to
+   fix anything it got wrong;
+2. **builds the house**: scale read by OCR from the dimension labels, walls / doors / windows / openings detected,
+   room names read, levels stacked, facade drawings put on the right side, site plan on the ground, switches wired to
+   lamps;
+3. opens the **3D view** with a card "What I built – please check" that lists what is certain and what needs a look
+   (e.g. "could not read a scale – calibrate with the 📏 tool").
+
+Everything stays editable afterwards in the Floor plans / Electrical tabs. Prefer to go level by level? Use
+*Set up manually*.
+
+## Lighting simulation
+
+* **Auto-wiring:** every switch controls the lamps of the space it faces (rooms joined by a doorway count as one space,
+  so the living-room switch also lights the open kitchen). Double switches split main and accent lights. Override per
+  symbol with "Switch group" in the Electrical tab, or press 🔌 *Auto-wire*.
+* In 3D, **click a switch or lamp** (or use the Lighting panel) to flick it: lamps glow, real point lights fall on the
+  walls, dimmers get a slider. **Night mode** switches the daylight off; "Evening: all lights on" shows the whole house.
+
+## Exterior: facades, garden, site
+
+* **Gevelplannen:** upload an elevation per side, drag a box around the building, and it is stretched over that side
+  (best for rectangular buildings). Wall colour (render / brick / cladding), roof colour and gable / flat roof.
+* **Garden:** lawn, pavement, trees. **Site plan (inplantingsplan):** draped on the ground; scale and position with the
+  normal calibrate / move tools (*Underlay: site plan*).
+
+## Architect & homeowner tools
+
+* room **areas** (shown on the 3D labels), floor area, volume, a window/floor **daylight** indicator per room;
+* **sun study**: month, time of day, plan orientation, animated day with shadows (Belgian latitude by default);
+* **circuit highlight**: show only the devices of one breaker;
+* **📄 Report** (printable HTML: levels, rooms, devices per circuit) and **📊 Device list** (CSV with room, circuit,
+  height per symbol) for the electrician or the file cabinet;
+* 📐 **measure** tool, ✨ **discover repeated symbols** (finds groups of identical glyphs on a situatieschema – you
+  name each group once), 🔍 teach-by-example, OCR.
+
+## Manual workflow
 
 1. **Home → "Click here to upload your plan"**. Add one file per level (basement, ground, first, second, attic…); each can
    have an optional situatieschema. PDFs and images are supported.

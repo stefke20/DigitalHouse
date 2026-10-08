@@ -27,7 +27,7 @@ export function newLevel(preset = LEVEL_PRESETS[1], extra = {}) {
   };
 }
 export function newProject(name) {
-  return { id: uid('pr'), name: name || 'My house', created: Date.now(), updated: Date.now(), levels: [], settings: { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8 }, thumb: null };
+  return { id: uid('pr'), name: name || 'My house', created: Date.now(), updated: Date.now(), levels: [], settings: { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8, garden: true }, facades: {}, thumb: null };
 }
 export const sortedLevels = p => [...p.levels].sort((a, b) => a.order - b.order);
 
@@ -144,7 +144,61 @@ export function projectBBox(p) {
 }
 
 export function normalizeProject(p) {
-  p.settings = { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8, ...(p.settings || {}) };
+  p.settings = { roof: true, type: 'residential', roofType: 'flat', roofPitch: 8, garden: true, ...(p.settings || {}) };
+  p.facades ||= {};
   for (const l of p.levels) { l.columns ||= []; l.rooms ||= []; }
   return p;
+}
+
+/* ---------- rooms: enclosed spaces found by flood-filling between walls ---------- */
+// Doorways ("opening" type) connect rooms (open-plan living + kitchen), doors and windows do not.
+export function roomGrid(level, cell = 0.1) {
+  if (!level.walls.length) return null;
+  const ext = wallExtensions(level);
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const w of level.walls) { x0 = Math.min(x0, w.x1, w.x2); x1 = Math.max(x1, w.x1, w.x2); y0 = Math.min(y0, w.y1, w.y2); y1 = Math.max(y1, w.y1, w.y2); }
+  cell = Math.max(cell, Math.ceil(Math.sqrt((x1 - x0 + 2) * (y1 - y0 + 2) / 1.2e6) * 20) / 20);
+  x0 -= 1; y0 -= 1; x1 += 1; y1 += 1;
+  const W = Math.ceil((x1 - x0) / cell), H = Math.ceil((y1 - y0) / cell);
+  const wall = new Uint8Array(W * H);
+  const stamp = (w, hw, e1, e2, from, to, val) => {
+    const L = wallLen(w); if (L < 1e-6) return;
+    const ux = (w.x2 - w.x1) / L, uy = (w.y2 - w.y1) / L;
+    const bx0 = Math.min(w.x1, w.x2) - hw - .5, bx1 = Math.max(w.x1, w.x2) + hw + .5, by0 = Math.min(w.y1, w.y2) - hw - .5, by1 = Math.max(w.y1, w.y2) + hw + .5;
+    for (let j = Math.max(0, Math.floor((by0 - y0) / cell)); j <= Math.min(H - 1, Math.floor((by1 - y0) / cell)); j++)
+      for (let i = Math.max(0, Math.floor((bx0 - x0) / cell)); i <= Math.min(W - 1, Math.floor((bx1 - x0) / cell)); i++) {
+        const px = x0 + (i + .5) * cell - w.x1, py = y0 + (j + .5) * cell - w.y1, u = px * ux + py * uy, v = -px * uy + py * ux;
+        if (u >= from && u <= to && Math.abs(v) <= hw) wall[j * W + i] = val;
+      }
+  };
+  for (const w of level.walls) { const [e1, e2] = ext.get(w.id); stamp(w, w.t / 2 + .01, e1, e2, -e1, wallLen(w) + e2, 1); }
+  for (const o of level.openings) if (o.type === 'opening') { const w = level.walls.find(x => x.id === o.wallId); if (w) stamp(w, w.t / 2 + .05, 0, 0, o.pos - o.width / 2, o.pos + o.width / 2, 0); }
+  const comp = new Uint16Array(W * H), rooms = new Map(); let next = 0;
+  const stack = [];
+  for (let k0 = 0; k0 < W * H; k0++) {
+    if (wall[k0] || comp[k0]) continue;
+    const id = ++next; let n = 0, border = false, sx = 0, sy = 0; stack.push(k0); comp[k0] = id;
+    while (stack.length) {
+      const k = stack.pop(), i = k % W, j = (k / W) | 0; n++; sx += i; sy += j;
+      if (i === 0 || j === 0 || i === W - 1 || j === H - 1) border = true;
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const a = i + di, b = j + dj; if (a < 0 || b < 0 || a >= W || b >= H) continue;
+        const q = b * W + a; if (wall[q] || comp[q]) continue; comp[q] = id; stack.push(q);
+      }
+    }
+    rooms.set(id, { id, cells: n, area: n * cell * cell, cx: x0 + (sx / n + .5) * cell, cy: y0 + (sy / n + .5) * cell, exterior: border });
+    if (next > 60000) break;
+  }
+  return { x0, y0, cell, W, H, comp, rooms };
+}
+/** room id at a plan position (0 = none / outside); looks a few cells around when the point sits on a wall */
+export function roomAt(g, x, y) {
+  if (!g) return 0;
+  const ci = Math.floor((x - g.x0) / g.cell), cj = Math.floor((y - g.y0) / g.cell);
+  for (let r = 0; r <= 5; r++) for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) {
+    if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+    const i = ci + di, j = cj + dj; if (i < 0 || j < 0 || i >= g.W || j >= g.H) continue;
+    const id = g.comp[j * g.W + i]; if (id) { const rm = g.rooms.get(id); return rm && !rm.exterior && rm.area > .8 ? id : 0; }
+  }
+  return 0;
 }
