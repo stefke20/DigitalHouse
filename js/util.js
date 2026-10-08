@@ -33,3 +33,16 @@ export function download(blob, name) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
+
+/** async replacement for window.prompt() (which Electron does not support) */
+export function askText(title, value = '', { placeholder = '' } = {}) {
+  return new Promise(resolve => {
+    let done = false;
+    const inp = h('input', { value, placeholder, style: { width: '100%' } });
+    const finish = v => { if (done) return; done = true; m.close(); resolve(v); };
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') finish(inp.value.trim() || null); if (e.key === 'Escape') finish(null); });
+    const m = modal(h('div', { style: { width: 'min(440px,90vw)' } }, h('h3', {}, title), inp,
+      h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'primary', onclick: () => finish(inp.value.trim() || null) }, 'OK'), h('button', { onclick: () => finish(null) }, 'Cancel'))), { onClose: () => finish(null) });
+    setTimeout(() => { inp.focus(); inp.select(); }, 30);
+  });
+}

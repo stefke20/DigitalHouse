@@ -14,6 +14,29 @@ npx http-server . -p 8080 -c-1      # or any static file server
 ```
 No build step. Three.js and pdf.js are vendored in `vendor/`.
 
+## Windows installer (desktop app)
+
+HouseVault also ships as a desktop app (Electron). The installer is named after the version in `package.json`:
+**`HouseVault-Setup-<version>.exe`** (NSIS, per-user, choose the install folder, Desktop + Start-menu shortcuts and an
+uninstaller). Your data stays on your PC (the app's local database); uninstalling does not delete it.
+
+```bash
+npm install
+npm start                # run the desktop app from source
+npm run dist             # build dist/HouseVault-Setup-<version>.exe  (Windows, or Linux/macOS with Wine)
+npm run web              # or just serve the web version
+```
+
+**Versioning:** `package.json` is the single source of truth – `npm run version:sync` writes `js/version.js`, which the
+app shows in the top bar and the About dialog. To release:
+
+```bash
+npm version minor -m "HouseVault %s"   # bumps package.json, syncs js/version.js, commits, creates tag v1.1.0
+git push --follow-tags                  # the "Release (Windows installer)" workflow builds the .exe and attaches it to the release
+```
+
+The installer is not code-signed, so Windows SmartScreen may show "unknown publisher" – choose *More info → Run anyway*.
+
 ## The easy way: drop everything
 
 On the home page click the big upload area (or drop files / a **whole folder**). HouseVault

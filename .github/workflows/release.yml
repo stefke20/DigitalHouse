@@ -1,0 +1,35 @@
+name: Release (Windows installer)
+
+on:
+  push:
+    tags: ['v*']          # e.g. v1.0.0 – create with `npm version minor` (tags + bumps package.json)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - name: Tag must match package.json version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          V="v$(node -p "require('./package.json').version")"
+          [ "$V" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match package.json ($V)"; exit 1; }
+      - run: npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HouseVault-Setup
+          path: dist/HouseVault-Setup-*.exe
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/HouseVault-Setup-*.exe
+          generate_release_notes: true

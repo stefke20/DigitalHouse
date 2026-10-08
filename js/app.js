@@ -1,10 +1,11 @@
-import { h, toast, modal, uid, debounce, fmtBytes, download } from './util.js';
+import { h, toast, modal, askText, uid, debounce, fmtBytes, download } from './util.js';
 import * as db from './db.js';
 import { LEVEL_PRESETS, presetsFor, newLevel, newProject, sortedLevels, wallLen, normalizeProject, roomGrid, elevations } from './model.js';
 import { SYMBOLS, CATEGORIES, allSymbols, getSymbol, svgMarkup, loadCustomSymbols, saveCustomSymbol, removeCustomSymbol } from './symbols.js';
 import { rasterize, isPdf, pdfPageCount } from './files.js';
 import { demoProject, demoIndustrial } from './demo.js';
 import { analyze, buildProject } from './pipeline.js';
+import { VERSION } from './version.js';
 import { computeStats } from './stats.js';
 import { autoName, shortName, wattOf, roomNameFor } from './naming.js';
 import { NOTE_CATS, ROUTE_KINDS } from './hidden.js';
@@ -303,7 +304,7 @@ function tab3d(project, body, save, q = new URLSearchParams()) {
       list.append(h('div', { class: 'layer' + (g.value > 0 ? '' : ' off'), style: { flexWrap: 'wrap' } },
         h('button', { class: 'small' + (g.value > 0 ? ' active' : ''), title: 'Switch this group on / off', onclick: () => viewer.toggleGroup(g.levelId, g.ctl) }, g.value > 0 ? '💡 On' : '○ Off'),
         h('span', { class: 'nm', style: { fontSize: '12.5px' } }, g.name, h('span', { class: 'muted' }, ` · ${g.levelName} · ${g.count}`)),
-        h('button', { class: 'small', title: 'Rename this lighting group', onclick: () => { const nm = prompt('Name for this lighting group:', g.name); if (nm) { const lv = project.levels.find(l => l.id === g.levelId); (lv.groupNames ||= {})[g.ctl || ''] = nm; save(); fillLights(); } } }, '✎'),
+        h('button', { class: 'small', title: 'Rename this lighting group', onclick: async () => { const nm = await askText('Name for this lighting group', g.name); if (nm) { const lv = project.levels.find(l => l.id === g.levelId); (lv.groupNames ||= {})[g.ctl || ''] = nm; save(); fillLights(); } } }, '✎'),
         g.dimmer ? h('input', { type: 'range', min: .1, max: 1, step: .05, value: g.value || 1, style: { width: '100%' }, title: 'Dimmer', oninput: e => { viewer.lightState.set(g.key, +e.target.value); viewer.updateLights(); } }) : null));
     }
     lightHolder.append(h('h4', {}, 'Lighting'),
@@ -737,7 +738,7 @@ async function docsView(projectId, projects) {
     for (const d of docs) {
       const pr = projects.find(p => p.id === d.projectId);
       list.append(h('tr', {}, h('td', {}, d.name), h('td', {}, h('span', { class: 'pill' }, DOC_CATS[d.category] || d.category)), h('td', {}, pr ? pr.name : '—'), h('td', {}, fmtBytes(d.size)), h('td', {}, new Date(d.created).toLocaleDateString()),
-        h('td', { style: { whiteSpace: 'nowrap' } }, h('button', { class: 'small', onclick: () => preview(d) }, 'View'), ' ', h('button', { class: 'small', title: 'Rename', onclick: async () => { const nm = prompt('Document name:', d.name); if (nm) { d.name = nm; await db.put('docs', d); render(); } } }, '✎'), ' ', h('button', { class: 'small', onclick: () => download(d.blob, d.name) }, '⬇'), ' ', h('button', { class: 'small danger', onclick: async () => { if (confirm('Delete this document?')) { await db.del('docs', d.id); render(); } } }, '✕'))));
+        h('td', { style: { whiteSpace: 'nowrap' } }, h('button', { class: 'small', onclick: () => preview(d) }, 'View'), ' ', h('button', { class: 'small', title: 'Rename', onclick: async () => { const nm = await askText('Document name', d.name); if (nm) { d.name = nm; await db.put('docs', d); render(); } } }, '✎'), ' ', h('button', { class: 'small', onclick: () => download(d.blob, d.name) }, '⬇'), ' ', h('button', { class: 'small danger', onclick: async () => { if (confirm('Delete this document?')) { await db.del('docs', d.id); render(); } } }, '✕'))));
     }
   }
   const list = h('tbody');
@@ -785,4 +786,5 @@ async function pageSymbols() {
 }
 
 /* ---------------- boot ---------------- */
+{ const nav = document.getElementById('mainnav'); if (nav) nav.append(h('span', { class: 'muted', style: { marginLeft: 'auto', fontSize: '11.5px', alignSelf: 'center' }, title: 'HouseVault version' }, 'v' + VERSION)); }
 loadCustomSymbols().catch(() => { }).finally(route);

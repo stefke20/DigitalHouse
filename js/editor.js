@@ -1,4 +1,4 @@
-import { uid, clamp } from './util.js';
+import { uid, clamp, askText } from './util.js';
 import { wallExtensions, wallLen, distPtSeg } from './model.js';
 import { getSymbol, symbolImage, CATEGORIES } from './symbols.js';
 import { detectWalls } from './detect.js';
@@ -191,12 +191,12 @@ export class Editor {
     } else if (t === 'measure') {
       const p = this.snapPt(wx, wy, { noGrid: true }); this.meas = (!this.meas || this.meas.b) ? { a: [p[0], p[1]] } : { ...this.meas, b: [p[0], p[1]] };
     } else if (t === 'note') {
-      const text = prompt('Note (what is hidden / important here?):'); if (text) { this.pushUndo(); const n = { id: uid('n'), x: wx, y: wy, z: 1.2, text, cat: this.noteCat || 'other' }; this.level.notes.push(n); this.changed(); this.select({ type: 'note', id: n.id, item: n }); }
+      askText('Note (what is hidden / important here?)').then(text => { if (text) { this.pushUndo(); const n = { id: uid('n'), x: wx, y: wy, z: 1.2, text, cat: this.noteCat || 'other' }; this.level.notes.push(n); this.changed(); this.select({ type: 'note', id: n.id, item: n }); } });
     } else if (t === 'route') {
       const p = this.snapPt(wx, wy, { from: this.routing ? this.routing.pts[this.routing.pts.length - 1] : null, noGrid: e.altKey });
       if (!this.routing) this.routing = { pts: [[p[0], p[1]]] }; else if (Math.hypot(p[0] - this.routing.pts.at(-1)[0], p[1] - this.routing.pts.at(-1)[1]) > .03) this.routing.pts.push([p[0], p[1]]);
     } else if (t === 'room') {
-      const text = prompt('Room / zone name:'); if (text) { this.pushUndo(); const r = { id: uid('r'), text, x: wx, y: wy }; this.level.rooms.push(r); this.changed(); this.select({ type: 'room', id: r.id, item: r }); }
+      askText('Room / zone name').then(text => { if (text) { this.pushUndo(); const r = { id: uid('r'), text, x: wx, y: wy }; this.level.rooms.push(r); this.changed(); this.select({ type: 'room', id: r.id, item: r }); } });
     } else if (t === 'teach') {
       const u = this.level.underlays[this.underlay]; if (!u) return;
       this.drag = { kind: 'teach', a: [wx, wy], b: [wx, wy] };

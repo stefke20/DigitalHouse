@@ -1,0 +1,64 @@
+{
+  "name": "housevault",
+  "productName": "HouseVault",
+  "version": "1.0.0",
+  "description": "Digital library for your house documents with a 3D plan viewer, lighting simulation and Belgian electrical symbol library.",
+  "author": "stefke20",
+  "license": "MIT",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "web": "npx --yes http-server . -p 8080 -c-1",
+    "version:sync": "node scripts/sync-version.js",
+    "icon": "python3 scripts/make-icon.py",
+    "dist": "npm run version:sync && electron-builder --win nsis --x64 --publish never",
+    "dist:dir": "npm run version:sync && electron-builder --win dir --x64 --publish never",
+    "version": "node scripts/sync-version.js && git add js/version.js",
+    "release:patch": "npm version patch -m \"HouseVault %s\"",
+    "release:minor": "npm version minor -m \"HouseVault %s\""
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "com.housevault.app",
+    "productName": "HouseVault",
+    "asar": false,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "index.html",
+      "css/**/*",
+      "js/**/*",
+      "vendor/**/*",
+      "package.json"
+    ],
+    "artifactName": "HouseVault-Setup-${version}.exe",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "HouseVault",
+      "uninstallDisplayName": "HouseVault ${version}",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
